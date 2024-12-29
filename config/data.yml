@@ -1,0 +1,35 @@
+paths:
+  ssh_zarr: "/scratch/user/aaupadhy/college/RA/final_data/SSH_Atlantic.zarr"
+  sst_zarr: "/scratch/user/aaupadhy/college/RA/final_data/SST_Atlantic.zarr"
+  vnt_zarr: "/scratch/user/aaupadhy/college/RA/final_data/VNT_Atlantic.zarr"
+  output_dir: "outputs"
+  model_dir: "models"
+
+data:
+  region_mask_value: 6
+  reference_latitude: 1600
+  tarea_conversion: 0.0001
+  dz_conversion: 0.01
+
+model:
+  d_model: 256
+  nhead: 8
+  num_layers: 4
+  dropout: 0.1
+  learning_rate: 1e-4
+  batch_size: 32
+  num_epochs: 100
+  gradient_clip_val: 1.0
+  patience: 10
+
+training:
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  random_seed: 42
+  device: "cuda"
+
+visualization:
+  fig_size: [12, 8]
+  dpi: 300
+  cmap: "cmocean.thermal"
