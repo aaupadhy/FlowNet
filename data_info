@@ -1,0 +1,66 @@
+(ML) [aaupadhy@grace2 FlowNet]$ ./scripts/analyze.sh
+=== Checking on-disk size (via du -hs) ===
+Dataset: /scratch/user/aaupadhy/college/RA/final_data/SSH_Atlantic.zarr | On-disk size: 6.8G
+Dataset: /scratch/user/aaupadhy/college/RA/final_data/SST_Atlantic.zarr | On-disk size: 5.9G
+Dataset: /scratch/user/aaupadhy/college/RA/final_data/VNT_Atlantic.zarr | On-disk size: 436G
+
+=== Python-based inspection of chunking and metadata ===
+------------------------------------------------------------------
+Opening /scratch/user/aaupadhy/college/RA/final_data/SSH_Atlantic.zarr using xarray.open_dataset(..., chunks=None)
+Dataset has variables: ['SSH']
+Dataset dimensions: FrozenMappingWarningOnValuesAccess({'time': 3240, 'nlat': 2400, 'nlon': 3600})
+
+Variable: SSH
+  Shape: (3240, 2400, 3600)
+  Dtype: float32
+  Attributes: {'cell_methods': 'time: mean', 'grid_loc': '2110', 'long_name': 'Sea Surface Height', 'units': 'centimeter'}
+  Encoding: {'chunks': (360, 1200, 1200), 'preferred_chunks': {'time': 360, 'nlat': 1200, 'nlon': 1200}, 'compressor': Blosc(cname='lz4', clevel=5, shuffle=SHUFFLE, blocksize=0), 'filters': None, '_FillValue': nan, 'dtype': dtype('float32')}
+  Dask .chunks: None
+
+Now opening the Zarr group directly with zarr.open(...): /scratch/user/aaupadhy/college/RA/final_data/SSH_Atlantic.zarr
+Zarr group structure:
+
+------------------------------------------------------------------
+Opening /scratch/user/aaupadhy/college/RA/final_data/SST_Atlantic.zarr using xarray.open_dataset(..., chunks=None)
+Dataset has variables: ['SST']
+Dataset dimensions: FrozenMappingWarningOnValuesAccess({'time': 3240, 'nlat': 2400, 'nlon': 3600})
+
+Variable: SST
+  Shape: (3240, 2400, 3600)
+  Dtype: float32
+  Attributes: {'cell_methods': 'time: mean', 'grid_loc': '3111', 'long_name': 'Potential Temperature', 'units': 'degC'}
+  Encoding: {'chunks': (360, 1200, 1200), 'preferred_chunks': {'time': 360, 'nlat': 1200, 'nlon': 1200}, 'compressor': Blosc(cname='lz4', clevel=5, shuffle=SHUFFLE, blocksize=0), 'filters': None, '_FillValue': nan, 'dtype': dtype('float32')}
+  Dask .chunks: None
+
+Now opening the Zarr group directly with zarr.open(...): /scratch/user/aaupadhy/college/RA/final_data/SST_Atlantic.zarr
+Zarr group structure:
+
+------------------------------------------------------------------
+Opening /scratch/user/aaupadhy/college/RA/final_data/VNT_Atlantic.zarr using xarray.open_dataset(..., chunks=None)
+Dataset has variables: ['TAREA', 'VNT', 'dz']
+Dataset dimensions: FrozenMappingWarningOnValuesAccess({'time': 3240, 'nlat': 2400, 'nlon': 3600, 'z_t': 62})
+
+Variable: TAREA
+  Shape: (3240, 2400, 3600)
+  Dtype: float64
+  Attributes: {'long_name': 'area of T cells', 'units': 'centimeter^2'}
+  Encoding: {'chunks': (72, 300, 300), 'preferred_chunks': {'time': 72, 'nlat': 300, 'nlon': 300}, 'compressor': Blosc(cname='lz4', clevel=5, shuffle=SHUFFLE, blocksize=0), 'filters': None, '_FillValue': nan, 'dtype': dtype('float64'), 'coordinates': 'TLAT TLONG'}
+  Dask .chunks: None
+
+Variable: VNT
+  Shape: (3240, 62, 2400, 3600)
+  Dtype: float32
+  Attributes: {'cell_methods': 'time: mean', 'grid_loc': '3121', 'long_name': 'Flux of Heat in grid-y direction', 'units': 'degC/s'}
+  Encoding: {'chunks': (72, 7, 300, 300), 'preferred_chunks': {'time': 72, 'z_t': 7, 'nlat': 300, 'nlon': 300}, 'compressor': Blosc(cname='lz4', clevel=5, shuffle=SHUFFLE, blocksize=0), 'filters': None, '_FillValue': nan, 'dtype': dtype('float32'), 'coordinates': 'TLAT TLONG'}
+  Dask .chunks: None
+
+Variable: dz
+  Shape: (3240, 62, 2400, 3600)
+  Dtype: float32
+  Attributes: {'long_name': 'thickness of layer k', 'units': 'centimeters'}
+  Encoding: {'chunks': (72, 62, 300, 300), 'preferred_chunks': {'time': 72, 'z_t': 62, 'nlat': 300, 'nlon': 300}, 'compressor': Blosc(cname='lz4', clevel=5, shuffle=SHUFFLE, blocksize=0), 'filters': None, '_FillValue': nan, 'dtype': dtype('float32'), 'coordinates': 'TLAT TLONG'}
+  Dask .chunks: None
+
+Now opening the Zarr group directly with zarr.open(...): /scratch/user/aaupadhy/college/RA/final_data/VNT_Atlantic.zarr
+Zarr group structure:
+

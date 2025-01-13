@@ -2,7 +2,7 @@
 #SBATCH --job-name=ocean_ml
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
-#SBATCH --time=13:00:00
+#SBATCH --time=15:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:a100:1
@@ -29,7 +29,7 @@ export DASK_DASHBOARD_PORT=8787
 COMPUTE_NODE=$(hostname -s)  # Get short hostname (e.g., g077)
 
 echo "To access Dask dashboard, run this command on your local machine:"
-echo "ssh -N -L 8787:${COMPUTE_NODE}.grace.hprc.tamu.edu:8787 aaupadhy@grace.hprc.tamu.edu"
+echo "ssh -N -L 8787:${COMPUTE_NODE}:8787 aaupadhy@grace.hprc.tamu.edu"
 echo "Then visit http://localhost:8787 in your browser"
 
 source ~/.bashrc

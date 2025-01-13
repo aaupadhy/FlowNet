@@ -5,31 +5,94 @@ paths:
   output_dir: "outputs"
   model_dir: "models"
 
+dask:
+  total_memory: 80           
+  n_workers: 2                # Number of Dask workers
+  threads_per_worker: 2          # Threads per worker
+  chunk_optimization: true       # Enable automatic chunk optimization
+  monitor_chunks: true           # Enable chunk performance monitoring
+  dashboard:
+    port: 8787                  # Dask dashboard port
+    verbose: true               # Detailed dashboard metrics
+  optimization:
+    fuse_operations: true       # Enable operation fusion
+    split_large_chunks: false   # Prevent automatic rechunking
+    retry_count: 10             # Number of retries for failed operations
+
 data:
-  region_mask_value: 6
-  reference_latitude: 1600
-  tarea_conversion: 0.0001
-  dz_conversion: 0.01
+  region_mask_value: 6           # Atlantic Ocean region mask value
+  reference_latitude: 1600       # Reference latitude index (~40°N)
+  tarea_conversion: 0.0001       # Area conversion factor
+  dz_conversion: 0.01           # Depth conversion factor
+  chunking:
+    time_chunk: 12              # Chunk by year (12 months)
+    spatial_chunk_target: 150    # Target spatial chunk size in MB
+    preserve_dims: ['z_t']      # Dimensions to preserve whole
 
-model:
-  d_model: 256
-  nhead: 8
-  num_layers: 4
-  dropout: 0.1
-  learning_rate: 1e-4
-  batch_size: 32
-  num_epochs: 100
-  gradient_clip_val: 1.0
-  patience: 10
-
-training:
-  train_split: 0.7
-  val_split: 0.15
-  test_split: 0.15
-  random_seed: 42
-  device: "cuda"
+# Monitoring configuration
+monitoring:
+  enabled: true                  # Enable comprehensive monitoring
+  save_metrics: true            # Save performance metrics
+  profiling:
+    enabled: true               # Enable detailed profiling
+    save_profiles: true         # Save profiling results
+  spatial_monitoring: true      # Monitor spatial data characteristics
+  temporal_monitoring: true     # Monitor temporal patterns
+  memory_monitoring: true       # Monitor memory usage
+  performance_monitoring: true  # Monitor computational performance
+  log_level: "INFO"            # Logging detail level
+  alerts:
+    memory_threshold: 0.90      # Alert if memory usage exceeds 90%
+    duration_threshold: 3600    # Alert if operation exceeds 1 hour
 
 visualization:
-  fig_size: [12, 8]
-  dpi: 300
-  cmap: "cmocean.thermal"
+  dpi: 300                      # Plot resolution
+  fig_size: [12, 8]            # Default figure size
+  save_formats: ['png', 'pdf']  # Output formats for plots
+  interactive: true            # Enable interactive visualizations
+  colormaps:
+    ssh: "cmo.thermal"         # Colormap for SSH
+    sst: "cmo.thermal"         # Colormap for SST
+    attention: "viridis"       # Colormap for attention maps
+
+# Model training parameters
+training:
+    d_model: 64
+    n_heads: 8
+    num_layers: 4
+    dim_feedforward: 128
+    dropout: 0.1
+    patience: 10
+    batch_size: 2
+    learning_rate: 0.0001
+    epochs: 100
+    early_stopping_patience: 10
+    validation_split: 0.15
+    test_split: 0.15
+    grad_clip: 1.0
+    weight_decay: 0.01
+    
+    optimizer:
+        name: "adamw"
+        weight_decay: 0.01
+    
+    scheduler:
+        name: "onecycle"
+        max_lr: 0.001
+        pct_start: 0.3
+
+    save_freq: 5
+    checkpoint_dir: "checkpoints"
+
+# Error handling and recovery
+error_handling:
+  max_retries: 3               # Maximum retry attempts
+  retry_delay: 5               # Delay between retries in seconds
+  save_state: true            # Save processing state for recovery
+  cleanup_on_fail: true       # Clean up resources on failure
+
+# Resource limits
+limits:
+  max_memory_gb: 150          # Maximum memory usage
+  max_duration_hours: 24      # Maximum job duration
+  min_free_memory_gb: 10      # Minimum free memory to maintai
