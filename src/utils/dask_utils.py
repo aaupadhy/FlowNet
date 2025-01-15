@@ -204,11 +204,9 @@ class DaskManager:
         output_path.mkdir(exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         
-        # Save performance metrics
         df = pd.DataFrame(self.performance_metrics)
         df.to_csv(output_path / f'performance_metrics_{timestamp}.csv', index=False)
         
-        # Save chunk profiles
         self.chunk_profiler.save_profile()
         
         # Save summary report
@@ -231,5 +229,4 @@ class DaskManager:
         if self.cluster:
             self.cluster.close()
 
-# Create global instance
 dask_monitor = DaskManager(logging.getLogger(__name__))

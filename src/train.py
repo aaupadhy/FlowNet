@@ -115,7 +115,7 @@ class OceanTrainer:
         for ssh, sst, target in val_loader:
             ssh = ssh.to(self.device)
             sst = sst.to(self.device)
-            output, _ = self.model(ssh, sst)
+            output = self.model(ssh, sst, attention_mask)
             predictions.extend(output.cpu().numpy())
             targets.extend(target.cpu().numpy())
             
@@ -129,15 +129,16 @@ class OceanTrainer:
         targets = []
         batch_times = []
         
-        for ssh, sst, target in val_loader:
+        for ssh, sst, attention_mask, target in val_loader:
             batch_start = time.time()
             
             ssh = ssh.to(self.device)
             sst = sst.to(self.device)
+            attention_mask = attention_mask.to(self.device)
             target = target.to(self.device)
             
             with autocast():
-                output, _ = self.model(ssh, sst)
+                output = self.model(ssh, sst, attention_mask)
                 loss = self.criterion(output, target)
             
             val_loss += loss.item()
@@ -236,7 +237,7 @@ class OceanTrainer:
             
             self.logger.info(f"\nEpoch {epoch+1}/{self.config['training']['epochs']}")
             
-            for i, (ssh, sst, target) in enumerate(train_loader):
+            for i, (ssh, sst, attention_mask, target) in enumerate(train_loader):
                 torch.cuda.empty_cache()
                 self.logger.info(f"Started training iteration {i}")
                 batch_start = time.time()
@@ -244,6 +245,7 @@ class OceanTrainer:
                 try:
                     ssh = ssh.to(self.device)
                     sst = sst.to(self.device)
+                    attention_mask = attention_mask.to(self.device)
                     target = target.to(self.device)
                     self.logger.info(f"Batch {i} data loaded to device")
                     self.logger.info(f"Batch shapes - SSH: {ssh.shape}, SST: {sst.shape}, Target: {target.shape}")
@@ -253,13 +255,11 @@ class OceanTrainer:
 
                 
                 with autocast():
-                    output, attention_maps = self.model(ssh, sst)
-                    print(f"Before loss calculation:")
-                    print(f"Output type: {output.dtype}, Output shape: {output.shape}")
-                    print(f"Output values: {output}")
+                    output = self.model(ssh, sst, attention_mask)
                     self.logger.info(f"Batch {i} forward pass complete")
                     loss = self.criterion(output, target)
                     loss = loss / accumulation_steps
+                self.scaler.scale(loss).backward()
                 
                 batch_loss = loss.item() * accumulation_steps
                 predictions = output.detach().cpu().numpy()
@@ -274,10 +274,9 @@ class OceanTrainer:
                         f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
                     )
                 
-                self.scaler.scale(loss).backward()
+                
                 
                 if (i + 1) % accumulation_steps == 0:
-                    # Gradient clipping
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip'])
                     
@@ -289,7 +288,6 @@ class OceanTrainer:
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
                 
-                # Log batch metrics to wandb
                 wandb.log({
                     'batch/loss': batch_loss,
                     'batch/r2': batch_r2,
@@ -312,10 +310,8 @@ class OceanTrainer:
             epoch_loss = epoch_loss / len(train_loader)
             epoch_time = time.time() - epoch_start
             
-            # Validation
             val_metrics = self.validate(val_loader)
             
-            # Detailed epoch logging
             self.logger.info(
                 f"\nEpoch {epoch+1} Summary:\n"
                 f"Train Loss: {epoch_loss:.4f}\n"
@@ -341,7 +337,6 @@ class OceanTrainer:
                 'epoch/memory_peak': torch.cuda.max_memory_allocated() / 1024**3
             }, step=epoch)
             
-            # Log metrics to monitor
             metrics = {
                 'epoch': epoch,
                 'train_loss': epoch_loss,
@@ -354,16 +349,13 @@ class OceanTrainer:
             }
             self.monitor.log_epoch(metrics, epoch)
             
-            # Save visualizations periodically
             if epoch % 5 == 0:
                 output_dir = Path(self.config['paths']['output_dir'])
                 viz = OceanVisualizer(output_dir)
                 
-                # Get spatial coordinates from config
                 tlat = self.config.get('data', {}).get('tlat', None)
                 tlong = self.config.get('data', {}).get('tlong', None)
                 
-                # Save attention visualizations
                 attention_save_dir = output_dir / 'attention_maps'
                 attention_save_dir.mkdir(exist_ok=True)
                 viz.plot_attention_maps(
@@ -372,7 +364,6 @@ class OceanTrainer:
                     save_path=f'attention_maps/epoch_{epoch}'
                 )
                 
-                # Save intermediate predictions
                 predictions_save_dir = output_dir / 'predictions'
                 predictions_save_dir.mkdir(exist_ok=True)
                 val_preds, val_targets = self.get_validation_predictions(val_loader)
@@ -382,7 +373,6 @@ class OceanTrainer:
                     save_path=f'predictions/epoch_{epoch}'
                 )
                 
-                # Log visualizations to wandb
                 wandb.log({
                     f"attention_maps/epoch_{epoch}": wandb.Image(
                         str(attention_save_dir / f'epoch_{epoch}.png')
@@ -394,7 +384,6 @@ class OceanTrainer:
                 
                 self.logger.info(f"Saved visualizations for epoch {epoch}")
             
-            # Checkpointing
             if val_metrics['val_loss'] < best_val_loss:
                 best_val_loss = val_metrics['val_loss']
                 patience_counter = 0
@@ -409,7 +398,6 @@ class OceanTrainer:
                 self.logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                 break
         
-        # Save final state
         self.save_checkpoint(epoch, metrics)
         self.monitor.finish()
         wandb.finish()
@@ -455,7 +443,7 @@ class OceanTrainer:
             target = target.to(self.device)
             
             with autocast():
-                output, attn_map = self.model(ssh, sst)
+                output = self.model(ssh, sst, attention_mask)
                 loss = self.criterion(output, target)
             
             predictions.extend((output.cpu() + heat_transport_mean).numpy())
@@ -562,7 +550,7 @@ class OceanTrainer:
                     sst = sst.cuda()
                     
                     with autocast():
-                        output, _ = self.model(ssh, sst)
+                        output = self.model(ssh, sst, attention_mask)
                     
                     prof.step()
             
