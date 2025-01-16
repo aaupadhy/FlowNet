@@ -67,9 +67,6 @@ class OceanDataProcessor:
 
     def _load_datasets(self, ssh_path, sst_path, vnt_path):
         try:
-            self.logger.info("Opening datasets...")
-            
-            # Step 1: Compute or load Atlantic bounds
             bounds_cache = Path('/scratch/user/aaupadhy/college/RA/final_data/atlantic_bounds.npz')
             recompute_bounds = False
             
@@ -87,29 +84,36 @@ class OceanDataProcessor:
 
             if recompute_bounds:
                 self.logger.info("Computing Atlantic bounds...")
-                # Load a single time slice to compute bounds
                 test_ssh = xr.open_dataset(ssh_path, engine="zarr").isel(time=0)['SSH']
                 test_sst = xr.open_dataset(sst_path, engine="zarr").isel(time=0)['SST']
                 
-                # Find valid points in both SSH and SST
-                ssh_valid = ~np.isnan(test_ssh)
-                sst_valid = ~np.isnan(test_sst)
-                valid_points = ssh_valid & sst_valid
+                chunk_size = 500
+                nlat, nlon = test_ssh.shape
+                valid_points = []
                 
-                if not np.any(valid_points):
-                    raise ValueError("No valid points found in the intersection of SSH and SST data")
+                for i in range(0, nlat, chunk_size):
+                    for j in range(0, nlon, chunk_size):
+                        ssh_chunk = test_ssh[i:i+chunk_size, j:j+chunk_size]
+                        sst_chunk = test_sst[i:i+chunk_size, j:j+chunk_size]
+                        valid_chunk = ~np.isnan(ssh_chunk) & ~np.isnan(sst_chunk)
+                        if np.any(valid_chunk):
+                            chunk_lats, chunk_lons = np.where(valid_chunk)
+                            valid_points.append((chunk_lats + i, chunk_lons + j))
+
+                if not valid_points:
+                    raise ValueError("No valid Atlantic points found")
+
+                all_valid_lats = np.concatenate([p[0] for p in valid_points])
+                all_valid_lons = np.concatenate([p[1] for p in valid_points])
+
+                self.lat_min, self.lat_max = all_valid_lats.min(), all_valid_lats.max()
+                self.lon_min, self.lon_max = all_valid_lons.min(), all_valid_lons.max()
                 
-                valid_lats, valid_lons = np.where(valid_points)
-                self.lat_min, self.lat_max = valid_lats.min(), valid_lats.max()
-                self.lon_min, self.lon_max = valid_lons.min(), valid_lons.max()
-                
-                # Cache the computed bounds
                 np.savez(bounds_cache,
                         lat_bounds=np.array([self.lat_min, self.lat_max]),
                         lon_bounds=np.array([self.lon_min, self.lon_max]))
                 self.logger.info(f"Computed and cached Atlantic bounds: lat [{self.lat_min}:{self.lat_max}], lon [{self.lon_min}:{self.lon_max}]")
 
-            # Step 2: Load datasets with computed bounds
             base_chunks = {'time': 180, 'nlat': 'auto', 'nlon': 'auto'}
             
             self.logger.info("Loading SSH dataset...")
@@ -118,33 +122,27 @@ class OceanDataProcessor:
                 nlat=slice(self.lat_min, self.lat_max+1),
                 nlon=slice(self.lon_min, self.lon_max+1)
             ).chunk(base_chunks)
-
-            # Create valid data mask (non-NaN values)
             ssh_valid = ~np.isnan(self.ssh_ds["SSH"].isel(time=0))
-            
+
             self.logger.info("Loading SST dataset...")
             self.sst_ds = xr.open_dataset(sst_path, engine="zarr", chunks=None)
             self.sst_ds = self.sst_ds.isel(
                 nlat=slice(self.lat_min, self.lat_max+1),
                 nlon=slice(self.lon_min, self.lon_max+1)
             ).chunk(base_chunks)
-            
             sst_valid = ~np.isnan(self.sst_ds["SST"].isel(time=0))
-            
+
             self.valid_mask = ssh_valid & sst_valid
             valid_points_count = np.sum(self.valid_mask)
             total_points = np.prod(self.valid_mask.shape)
             
-            # self.logger.info(f"Valid points: {valid_points_count} out of {total_points} {valid_points_count/total_points*100:.2f}%)")
-            
             if valid_points_count == 0:
                 raise ValueError("No valid data points found in the Atlantic region")
-                
-            # Step 3: Apply mask and compute statistics
+
             with dask_monitor.profile_task("compute_statistics"):
                 self.logger.info("Computing SSH statistics...")
                 self.ssh_mean, self.ssh_std = self._compute_mean_std(
-                    self.ssh_ds["SSH"].where(self.valid_mask), 
+                    self.ssh_ds["SSH"].where(self.valid_mask),
                     var_name="SSH"
                 )
                 
@@ -154,7 +152,6 @@ class OceanDataProcessor:
                     var_name="SST"
                 )
 
-            # Step 4: Load and process VNT dataset
             self.logger.info("Loading VNT dataset...")
             vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 450, 'z_t': None}
             self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
@@ -163,22 +160,17 @@ class OceanDataProcessor:
                 nlon=slice(self.lon_min, self.lon_max+1)
             )
             
-            # Apply the same mask to VNT-related variables
-            self.vnt_ds["VNT"] = self.vnt_ds["VNT"].where(self.valid_mask)
-            self.vnt_ds["TAREA"] = self.vnt_ds["TAREA"].where(self.valid_mask)
-            self.vnt_ds["dz"] = self.vnt_ds["dz"].where(self.valid_mask)
-            
+            # self.vnt_ds["VNT"] = self.vnt_ds["VNT"].where(self.valid_mask)
+            # self.vnt_ds["TAREA"] = self.vnt_ds["TAREA"].where(self.valid_mask)
+            # self.vnt_ds["dz"] = self.vnt_ds["dz"].where(self.valid_mask)
             self.vnt_ds = self.vnt_ds.chunk(vnt_chunks).unify_chunks()
             
             self.log_chunk_stats(self.vnt_ds["VNT"], array_name="VNT")
             
-            self.tarea_conversion = 0.0001
+            self.tarea_conversion = 0.0001  
             self.dz_conversion = 0.01
-            
-            # Store shape after processing
             self.shape = self.sst_ds["SST"].shape
             
-            # Step 5: Store statistics for validation
             self.stats = {
                 'ssh_valid_points': valid_points_count,
                 'total_points': total_points,
@@ -190,9 +182,7 @@ class OceanDataProcessor:
                 'grid_shape': self.shape
             }
             
-            # Step 6: Validate statistics
             self._validate_statistics()
-            
             self.logger.info("Successfully loaded all datasets")
             
         except Exception as e:
@@ -202,20 +192,18 @@ class OceanDataProcessor:
     def _validate_statistics(self):
         """Validate the computed statistics to ensure they make sense."""
         
-        # Check data coverage
-        coverage_threshold = 10  # 10% minimum coverage
+        coverage_threshold = 10
         if self.stats['coverage_percentage'] < coverage_threshold:
             raise ValueError(
                 f"Insufficient data coverage: {self.stats['coverage_percentage']:.2f}% "
                 f"(threshold: {coverage_threshold}%)"
             )
         
-        # Check for reasonable ranges in statistics
         stat_checks = {
-            'ssh_mean': (-500, 500),    # reasonable SSH range in cm
-            'sst_mean': (-5, 35),       # reasonable SST range in °C
-            'ssh_std': (0, 100),        # reasonable SSH std in cm
-            'sst_std': (0, 20)          # reasonable SST std in °C
+            'ssh_mean': (-500, 500),    
+            'sst_mean': (-5, 35),       
+            'ssh_std': (0, 100),       
+            'sst_std': (0, 20)
         }
         
         for stat_name, (min_val, max_val) in stat_checks.items():
@@ -236,13 +224,10 @@ class OceanDataProcessor:
                 self.logger.info(f"{key}: {value:.4f}")
             else:
                 self.logger.info(f"{key}: {value}")
-            
 
 
     def _compute_mean_std(self, data_array, var_name: str, dim="time"):
-        """Compute mean and standard deviation for valid (non-NaN) data points only."""
         cache_file = self.cache_dir / f'{var_name}_stats.npy'
-        
         if cache_file.exists():
             try:
                 stats = np.load(cache_file)
@@ -252,43 +237,61 @@ class OceanDataProcessor:
                 return mean_da, std_da
             except Exception as e:
                 self.logger.warning(f"Failed to load cached stats: {str(e)}. Recomputing...")
+
+        chunk_size = 60
+        total_times = len(data_array.time)
+        running_sum = None
+        running_count = 0
+        running_sq_sum = None
         
-        # Create masks for valid data (excluding both NaNs and zeros where appropriate)
-        valid_data = ~np.isnan(data_array)
-        if var_name in ['SSH', 'SST']:  # For these variables, zero might be a valid value
-            data_mask = valid_data
-        else:  # For other variables like VNT, we might want to exclude zeros
-            data_mask = valid_data & (data_array != 0)
+        self.logger.info(f"Computing statistics for {var_name}")
+        self.logger.info(f"Total timesteps: {total_times}")
+        self.logger.info(f"Input shape: {data_array.shape}")
         
-        # Use xarray's where to properly handle the masking
-        masked_data = data_array.where(data_mask)
-        
-        # Compute statistics only for valid data points
-        sum_valid = da.sum(masked_data, axis=data_array.get_axis_num(dim))
-        count_valid = da.sum(data_mask, axis=data_array.get_axis_num(dim))
-        sum_squares_valid = da.sum((masked_data ** 2), axis=data_array.get_axis_num(dim))
-        
-        # Compute global statistics
-        total_sum = sum_valid.sum().compute()
-        total_count = count_valid.sum().compute()
-        total_sum_squares = sum_squares_valid.sum().compute()
-        
-        # Calculate mean and std only for valid points
-        global_mean = total_sum / total_count
-        global_variance = (total_sum_squares / total_count) - (global_mean ** 2)
-        global_std = np.sqrt(np.maximum(global_variance, 0))  # Ensure non-negative
-        
+        for start_idx in range(0, total_times, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_times)
+            chunk = data_array.isel(time=slice(start_idx, end_idx))
+            
+            chunk_valid = ~np.isnan(chunk)
+            chunk_sum = chunk.where(chunk_valid).sum(dim=dim, skipna=True).compute()
+            chunk_count = chunk_valid.sum(dim=dim).compute()
+            chunk_sq_sum = (chunk.where(chunk_valid) ** 2).sum(dim=dim, skipna=True).compute()
+            
+            self.logger.info(f"Chunk {start_idx}-{end_idx}:")
+            self.logger.info(f"  Valid points: {float(chunk_count.mean())}")
+            self.logger.info(f"  Sum: {float(chunk_sum.mean())}")
+            self.logger.info(f"  Sq Sum: {float(chunk_sq_sum.mean())}")
+            
+            if running_sum is None:
+                running_sum = chunk_sum
+                running_sq_sum = chunk_sq_sum
+            else:
+                running_sum += chunk_sum
+                running_sq_sum += chunk_sq_sum
+            running_count += chunk_count
+
+        self.logger.info("Final accumulation:")
+        self.logger.info(f"  Total sum: {float(running_sum.mean())}")
+        self.logger.info(f"  Total count: {float(running_count.mean())}")
+        self.logger.info(f"  Total sq sum: {float(running_sq_sum.mean())}")
+
+        mean = running_sum / running_count
+        variance = (running_sq_sum / running_count) - (mean ** 2)
+        std = xr.where(variance > 0, np.sqrt(variance), 0)
+
         dims = [d for d in data_array.dims if d != dim]
         coords = {k: v for k, v in data_array.coords.items() if k != dim}
         if "time" in coords:
             coords.pop("time")
-            
-        mean_da = xr.DataArray(global_mean, dims=dims, coords=coords)
-        std_da = xr.DataArray(global_std, dims=dims, coords=coords)
         
-        # Cache the statistics
+        mean_da = xr.DataArray(mean, dims=dims, coords=coords)
+        std_da = xr.DataArray(std, dims=dims, coords=coords)
+        
+        self.logger.info("Final statistics:")
+        self.logger.info(f"  Mean: {float(mean_da.mean())}")
+        self.logger.info(f"  Std: {float(std_da.mean())}")
+        
         np.save(cache_file, np.array([mean_da.values, std_da.values]))
-        
         return mean_da, std_da
 
     def get_spatial_data(self):
@@ -318,19 +321,17 @@ class OceanDataProcessor:
             try:
                 heat_transport = np.load(cache_file)
                 mean_transport = np.load(cache_mean_file)
-                
                 self.logger.info(f"Loaded cached heat transport data:")
                 self.logger.info(f"  Shape: {heat_transport.shape}")
                 self.logger.info(f"  Range: {heat_transport.min():.2e} to {heat_transport.max():.2e}")
                 self.logger.info(f"  Mean: {mean_transport:.2e}")
-                
                 return heat_transport, mean_transport
-                
             except Exception as e:
                 self.logger.warning(f"Failed to load cached data: {str(e)}. Recomputing...")
-        
+                
         try:
             self.logger.info(f"Calculating heat transport for latitude index {latitude_index}")
+            valid_mask_slice = self.valid_mask[latitude_index]
             
             vnt = self.vnt_ds["VNT"].isel(nlat=latitude_index)
             self.logger.info(f"VNT shape after lat selection: {vnt.shape}")
@@ -341,25 +342,28 @@ class OceanDataProcessor:
             dz = self.vnt_ds["dz"].isel(nlat=latitude_index)
             self.logger.info(f"dz shape: {dz.shape}")
             
-            tarea_scaled = tarea * self.tarea_conversion
-            dz_scaled = dz * self.dz_conversion
+            # Calculate in smaller chunks
+            chunk_size = 60
+            total_times = vnt.shape[0]
+            heat_transport_list = []
             
-            step1 = vnt * tarea_scaled
-            self.logger.info(f"Shape after VNT * TAREA: {step1.shape}")
-            
-            step2 = step1 * dz_scaled
-            self.logger.info(f"Shape after multiplying with dz: {step2.shape}")
-            
-            heat_transport = step2.sum(dim='z_t')
-            self.logger.info(f"Shape after summing z_t: {heat_transport.shape}")
-            
-            heat_transport = heat_transport.sum(dim='nlon')
-            self.logger.info(f"Shape after summing nlon: {heat_transport.shape}")
-            
-            heat_transport = heat_transport.compute()
-            self.logger.info(f"Final heat transport shape: {heat_transport.shape}")
-            
-            mean_transport = float(heat_transport.mean())
+            for start_idx in range(0, total_times, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_times)
+                
+                vnt_chunk = vnt.isel(time=slice(start_idx, end_idx))
+                tarea_chunk = tarea
+                dz_chunk = dz
+                
+                chunk_transport = (
+                    vnt_chunk * 
+                    tarea_chunk * self.tarea_conversion * 
+                    dz_chunk * self.dz_conversion
+                ).where(valid_mask_slice).sum(dim=['z_t', 'nlon']).compute()
+                
+                heat_transport_list.append(chunk_transport)
+                
+            heat_transport = np.concatenate(heat_transport_list)
+            mean_transport = float(np.mean(heat_transport))
             
             np.save(cache_file, heat_transport)
             np.save(cache_mean_file, mean_transport)
@@ -369,11 +373,10 @@ class OceanDataProcessor:
             self.logger.info(f"  Mean: {mean_transport:.2e}")
             
             return heat_transport, mean_transport
-                
+        
         except Exception as e:
             self.logger.error(f"Error calculating heat transport: {str(e)}")
             raise
-            
         finally:
             self._cleanup_memory()
 
@@ -403,20 +406,15 @@ class OceanDataset(Dataset):
                 self.sst.isel(time=idx)
             )
             
-            # Create valid data mask
-            mask = ~np.isnan(ssh_data.values) & ~np.isnan(sst_data.values)
-            
-            # Normalize data
             ssh_norm = (ssh_data.values - self.ssh_mean.values) / self.ssh_std.values
             sst_norm = (sst_data.values - self.sst_mean.values) / self.sst_std.values
             
-            # Zero out NaN values after normalization
-            ssh_norm = np.where(mask, ssh_norm, 0)
-            sst_norm = np.where(mask, sst_norm, 0)
+            ssh_norm = ssh_norm * self.valid_mask.values
+            sst_norm = sst_norm * self.valid_mask.values
             
             ssh_tensor = torch.from_numpy(ssh_norm).float().unsqueeze(0)
             sst_tensor = torch.from_numpy(sst_norm).float().unsqueeze(0)
-            mask_tensor = torch.from_numpy(mask).float()
+            mask_tensor = torch.from_numpy(self.valid_mask.values).float()
             
             ssh_downsampled = F.avg_pool2d(ssh_tensor, kernel_size=2, stride=2)
             sst_downsampled = F.avg_pool2d(sst_tensor, kernel_size=2, stride=2)
