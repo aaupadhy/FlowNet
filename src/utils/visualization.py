@@ -121,10 +121,10 @@ class OceanVisualizer:
         ax.coastlines(resolution='50m')
         ax.add_feature(cfeature.BORDERS, linestyle=':')
         ax.gridlines(draw_labels=True)
-
-        data_subset = data[::4, ::4]
-        tlat_subset = tlat[::4, ::4]
-        tlong_subset = tlong[::4, ::4]
+        
+        data_subset = data[::2, ::2]
+        tlat_subset = tlat[::2, ::2]
+        tlong_subset = tlong[::2, ::2]
         
         vmin, vmax = np.nanpercentile(data_subset, [2, 98])
         im = ax.pcolormesh(

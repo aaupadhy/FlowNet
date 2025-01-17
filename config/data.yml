@@ -7,55 +7,52 @@ paths:
 
 dask:
   total_memory: 80           
-  n_workers: 2                # Number of Dask workers
-  threads_per_worker: 2          # Threads per worker
-  chunk_optimization: true       # Enable automatic chunk optimization
-  monitor_chunks: true           # Enable chunk performance monitoring
+  n_workers: 2               
+  threads_per_worker: 2         
+  chunk_optimization: true      
+  monitor_chunks: true           
   dashboard:
-    port: 8787                  # Dask dashboard port
-    verbose: true               # Detailed dashboard metrics
+    port: 8787                 
+    verbose: true              
   optimization:
-    fuse_operations: true       # Enable operation fusion
-    split_large_chunks: false   # Prevent automatic rechunking
-    retry_count: 10             # Number of retries for failed operations
+    fuse_operations: true       
+    split_large_chunks: false   
+    retry_count: 10            
 
 data:
-  region_mask_value: 6           # Atlantic Ocean region mask value
-  reference_latitude: 1600       # Reference latitude index (~40°N)
-  tarea_conversion: 0.0001       # Area conversion factor
-  dz_conversion: 0.01           # Depth conversion factor
+  region_mask_value: 6          
+  reference_latitude: 1600      
+  tarea_conversion: 0.0001       
+  dz_conversion: 0.01          
   chunking:
-    time_chunk: 12              # Chunk by year (12 months)
-    spatial_chunk_target: 150    # Target spatial chunk size in MB
-    preserve_dims: ['z_t']      # Dimensions to preserve whole
+    time_chunk: 180          
+    spatial_chunk_target: 300    
+    preserve_dims: ['z_t']     
 
-# Monitoring configuration
 monitoring:
-  enabled: true                  # Enable comprehensive monitoring
-  save_metrics: true            # Save performance metrics
+  enabled: true                 
+  save_metrics: true         
   profiling:
-    enabled: true               # Enable detailed profiling
-    save_profiles: true         # Save profiling results
-  spatial_monitoring: true      # Monitor spatial data characteristics
-  temporal_monitoring: true     # Monitor temporal patterns
-  memory_monitoring: true       # Monitor memory usage
-  performance_monitoring: true  # Monitor computational performance
-  log_level: "INFO"            # Logging detail level
+    enabled: true             
+    save_profiles: true         
+  spatial_monitoring: true      
+  temporal_monitoring: true    
+  memory_monitoring: true      
+  performance_monitoring: true  
+  log_level: "INFO"        
   alerts:
-    memory_threshold: 0.90      # Alert if memory usage exceeds 90%
-    duration_threshold: 3600    # Alert if operation exceeds 1 hour
+    memory_threshold: 0.90      
+    duration_threshold: 3600  
 
 visualization:
-  dpi: 300                      # Plot resolution
-  fig_size: [12, 8]            # Default figure size
-  save_formats: ['png', 'pdf']  # Output formats for plots
-  interactive: true            # Enable interactive visualizations
+  dpi: 300
+  fig_size: [12, 8]            
+  save_formats: ['png', 'pdf'] 
+  interactive: true           
   colormaps:
-    ssh: "cmo.thermal"         # Colormap for SSH
-    sst: "cmo.thermal"         # Colormap for SST
-    attention: "viridis"       # Colormap for attention maps
-
-# Model training parameters
+    ssh: "cmo.thermal"        
+    sst: "cmo.thermal"         
+    attention: "viridis"      
 training:
     d_model: 64
     n_heads: 8
@@ -63,9 +60,9 @@ training:
     dim_feedforward: 128
     dropout: 0.1
     patience: 10
-    batch_size: 2
+    batch_size: 8
     learning_rate: 0.0001
-    epochs: 100
+    epochs: 10
     early_stopping_patience: 10
     validation_split: 0.15
     test_split: 0.15
@@ -84,15 +81,13 @@ training:
     save_freq: 5
     checkpoint_dir: "checkpoints"
 
-# Error handling and recovery
 error_handling:
-  max_retries: 3               # Maximum retry attempts
-  retry_delay: 5               # Delay between retries in seconds
-  save_state: true            # Save processing state for recovery
-  cleanup_on_fail: true       # Clean up resources on failure
+  max_retries: 3              
+  retry_delay: 5              
+  save_state: true           
+  cleanup_on_fail: true     
 
-# Resource limits
 limits:
-  max_memory_gb: 150          # Maximum memory usage
-  max_duration_hours: 24      # Maximum job duration
-  min_free_memory_gb: 10      # Minimum free memory to maintai
+  max_memory_gb: 150          
+  max_duration_hours: 24      
+  min_free_memory_gb: 10      

@@ -63,123 +63,56 @@ class OceanDataProcessor:
             self.logger.info(f"  {key}: {value}")
         
         return stats
-
-
+    
     def _load_datasets(self, ssh_path, sst_path, vnt_path):
         try:
-            bounds_cache = Path('/scratch/user/aaupadhy/college/RA/final_data/atlantic_bounds.npz')
-            recompute_bounds = False
-            
-            if bounds_cache.exists():
-                try:
-                    cached_bounds = np.load(bounds_cache)
-                    self.lat_min, self.lat_max = cached_bounds['lat_bounds']
-                    self.lon_min, self.lon_max = cached_bounds['lon_bounds']
-                    self.logger.info(f"Loaded cached Atlantic bounds: lat [{self.lat_min}:{self.lat_max}], lon [{self.lon_min}:{self.lon_max}]")
-                except Exception as e:
-                    self.logger.warning(f"Failed to load cached bounds: {str(e)}. Will recompute.")
-                    recompute_bounds = True
-            else:
-                recompute_bounds = True
-
-            if recompute_bounds:
-                self.logger.info("Computing Atlantic bounds...")
-                test_ssh = xr.open_dataset(ssh_path, engine="zarr").isel(time=0)['SSH']
-                test_sst = xr.open_dataset(sst_path, engine="zarr").isel(time=0)['SST']
-                
-                chunk_size = 500
-                nlat, nlon = test_ssh.shape
-                valid_points = []
-                
-                for i in range(0, nlat, chunk_size):
-                    for j in range(0, nlon, chunk_size):
-                        ssh_chunk = test_ssh[i:i+chunk_size, j:j+chunk_size]
-                        sst_chunk = test_sst[i:i+chunk_size, j:j+chunk_size]
-                        valid_chunk = ~np.isnan(ssh_chunk) & ~np.isnan(sst_chunk)
-                        if np.any(valid_chunk):
-                            chunk_lats, chunk_lons = np.where(valid_chunk)
-                            valid_points.append((chunk_lats + i, chunk_lons + j))
-
-                if not valid_points:
-                    raise ValueError("No valid Atlantic points found")
-
-                all_valid_lats = np.concatenate([p[0] for p in valid_points])
-                all_valid_lons = np.concatenate([p[1] for p in valid_points])
-
-                self.lat_min, self.lat_max = all_valid_lats.min(), all_valid_lats.max()
-                self.lon_min, self.lon_max = all_valid_lons.min(), all_valid_lons.max()
-                
-                np.savez(bounds_cache,
-                        lat_bounds=np.array([self.lat_min, self.lat_max]),
-                        lon_bounds=np.array([self.lon_min, self.lon_max]))
-                self.logger.info(f"Computed and cached Atlantic bounds: lat [{self.lat_min}:{self.lat_max}], lon [{self.lon_min}:{self.lon_max}]")
-
             base_chunks = {'time': 180, 'nlat': 'auto', 'nlon': 'auto'}
             
             self.logger.info("Loading SSH dataset...")
             self.ssh_ds = xr.open_dataset(ssh_path, engine="zarr", chunks=None)
-            self.ssh_ds = self.ssh_ds.isel(
-                nlat=slice(self.lat_min, self.lat_max+1),
-                nlon=slice(self.lon_min, self.lon_max+1)
-            ).chunk(base_chunks)
-            ssh_valid = ~np.isnan(self.ssh_ds["SSH"].isel(time=0))
-
+            self.ssh_ds = self.ssh_ds.chunk(base_chunks)
+            
             self.logger.info("Loading SST dataset...")
             self.sst_ds = xr.open_dataset(sst_path, engine="zarr", chunks=None)
-            self.sst_ds = self.sst_ds.isel(
-                nlat=slice(self.lat_min, self.lat_max+1),
-                nlon=slice(self.lon_min, self.lon_max+1)
-            ).chunk(base_chunks)
-            sst_valid = ~np.isnan(self.sst_ds["SST"].isel(time=0))
-
-            self.valid_mask = ssh_valid & sst_valid
-            valid_points_count = np.sum(self.valid_mask)
-            total_points = np.prod(self.valid_mask.shape)
+            self.sst_ds = self.sst_ds.chunk(base_chunks)
             
-            if valid_points_count == 0:
-                raise ValueError("No valid data points found in the Atlantic region")
+            self.logger.info("Loading VNT dataset...")
+            vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 300, 'z_t': None}
+            self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
+            self.vnt_ds = self.vnt_ds.chunk(vnt_chunks)
 
+            self.reference_latitude = self._find_reference_latitude()
+            
             with dask_monitor.profile_task("compute_statistics"):
+                ssh_sample = self.ssh_ds["SSH"].isel(time=0).compute()
+                self.logger.info(f"SSH sample stats:")
+                self.logger.info(f"Shape: {ssh_sample.shape}")
+                self.logger.info(f"Any NaNs: {np.any(np.isnan(ssh_sample))}")
+                self.logger.info(f"Min/Max: {float(ssh_sample.min())}/{float(ssh_sample.max())}")
                 self.logger.info("Computing SSH statistics...")
                 self.ssh_mean, self.ssh_std = self._compute_mean_std(
-                    self.ssh_ds["SSH"].where(self.valid_mask),
+                    self.ssh_ds["SSH"],
                     var_name="SSH"
                 )
-                
+                self.logger.info(f"Final SSH stats:")
+                self.logger.info(f"Mean: {float(self.ssh_mean.mean())}")
+                self.logger.info(f"Std: {float(self.ssh_std.mean())}")
                 self.logger.info("Computing SST statistics...")
                 self.sst_mean, self.sst_std = self._compute_mean_std(
-                    self.sst_ds["SST"].where(self.valid_mask),
+                    self.sst_ds["SST"],
                     var_name="SST"
                 )
 
-            self.logger.info("Loading VNT dataset...")
-            vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 450, 'z_t': None}
-            self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
-            self.vnt_ds = self.vnt_ds.isel(
-                nlat=slice(self.lat_min, self.lat_max+1),
-                nlon=slice(self.lon_min, self.lon_max+1)
-            )
-            
-            # self.vnt_ds["VNT"] = self.vnt_ds["VNT"].where(self.valid_mask)
-            # self.vnt_ds["TAREA"] = self.vnt_ds["TAREA"].where(self.valid_mask)
-            # self.vnt_ds["dz"] = self.vnt_ds["dz"].where(self.valid_mask)
-            self.vnt_ds = self.vnt_ds.chunk(vnt_chunks).unify_chunks()
-            
-            self.log_chunk_stats(self.vnt_ds["VNT"], array_name="VNT")
-            
-            self.tarea_conversion = 0.0001  
+            self.tarea_conversion = 0.0001
             self.dz_conversion = 0.01
             self.shape = self.sst_ds["SST"].shape
             
             self.stats = {
-                'ssh_valid_points': valid_points_count,
-                'total_points': total_points,
-                'coverage_percentage': valid_points_count/total_points*100,
-                'ssh_mean': float(self.ssh_mean.values.mean()),
-                'ssh_std': float(self.ssh_std.values.mean()),
-                'sst_mean': float(self.sst_mean.values.mean()),
-                'sst_std': float(self.sst_std.values.mean()),
-                'grid_shape': self.shape
+                'grid_shape': self.shape,
+                'ssh_mean': float(np.nanmean(self.ssh_mean.values)), 
+                'ssh_std': float(np.nanmean(self.ssh_std.values)),   
+                'sst_mean': float(np.nanmean(self.sst_mean.values)),  
+                'sst_std': float(np.nanmean(self.sst_std.values))    
             }
             
             self._validate_statistics()
@@ -190,19 +123,10 @@ class OceanDataProcessor:
             raise
 
     def _validate_statistics(self):
-        """Validate the computed statistics to ensure they make sense."""
-        
-        coverage_threshold = 10
-        if self.stats['coverage_percentage'] < coverage_threshold:
-            raise ValueError(
-                f"Insufficient data coverage: {self.stats['coverage_percentage']:.2f}% "
-                f"(threshold: {coverage_threshold}%)"
-            )
-        
         stat_checks = {
-            'ssh_mean': (-500, 500),    
-            'sst_mean': (-5, 35),       
-            'ssh_std': (0, 100),       
+            'ssh_mean': (-500, 500),
+            'sst_mean': (-5, 35),
+            'ssh_std': (0, 100),
             'sst_std': (0, 20)
         }
         
@@ -217,15 +141,53 @@ class OceanDataProcessor:
                     f"{stat_name} ({value:.2f}) outside reasonable range "
                     f"[{min_val}, {max_val}]"
                 )
-        
+
         self.logger.info("Statistics validation passed:")
         for key, value in self.stats.items():
             if isinstance(value, (int, float)):
                 self.logger.info(f"{key}: {value:.4f}")
             else:
                 self.logger.info(f"{key}: {value}")
+                
+    def _find_reference_latitude(self):
+        cache_file = Path('/scratch/user/aaupadhy/college/RA/final_data/cache/ref_lat_index.npy')
+        
+        if cache_file.exists():
+            try:
+                ref_lat_idx = np.load(cache_file)
+                tlat = self.vnt_ds['TLAT'][0]
+                actual_lat = float(tlat[ref_lat_idx].mean())
+                self.logger.info(f"Loaded cached reference latitude index {ref_lat_idx} corresponding to {actual_lat:.2f}°N")
+                return ref_lat_idx
+            except Exception as e:
+                self.logger.warning(f"Failed to load cached reference latitude: {str(e)}. Recomputing...")
+        
+        try:
+            tlat = self.vnt_ds['TLAT'][0]
+            self.logger.info(f"TLAT: {tlat}")
+            lat_mask = (tlat >= 39.9) & (tlat <= 40.1)
+            lat_mask = lat_mask.compute()
+            
+            lat_indices = np.where(lat_mask)
+            if len(lat_indices) == 0:
+                raise ValueError("No points found at 40°N latitude")
 
+            self.logger.info(f"Lat indices: {lat_indices}")
+            
+            ref_lat_idx = int(np.median(lat_indices))
+            actual_lat = float(tlat[ref_lat_idx].mean())
+            
+            np.save(cache_file, ref_lat_idx)
+            
+            self.logger.info(f"Found and cached reference latitude index {ref_lat_idx} corresponding to {actual_lat:.2f}°N")
+            self.logger.info(f"Number of points found at ~40°N: {len(lat_indices)}")
+            
+            return ref_lat_idx
 
+        except Exception as e:
+            self.logger.error(f"Error finding reference latitude: {str(e)}")
+            raise
+        
     def _compute_mean_std(self, data_array, var_name: str, dim="time"):
         cache_file = self.cache_dir / f'{var_name}_stats.npy'
         if cache_file.exists():
@@ -235,64 +197,31 @@ class OceanDataProcessor:
                 std_da = xr.DataArray(stats[1])
                 self.logger.info(f"Loaded cached statistics for {var_name}")
                 return mean_da, std_da
+            
             except Exception as e:
                 self.logger.warning(f"Failed to load cached stats: {str(e)}. Recomputing...")
 
-        chunk_size = 60
-        total_times = len(data_array.time)
-        running_sum = None
-        running_count = 0
-        running_sq_sum = None
-        
         self.logger.info(f"Computing statistics for {var_name}")
-        self.logger.info(f"Total timesteps: {total_times}")
         self.logger.info(f"Input shape: {data_array.shape}")
-        
-        for start_idx in range(0, total_times, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_times)
-            chunk = data_array.isel(time=slice(start_idx, end_idx))
-            
-            chunk_valid = ~np.isnan(chunk)
-            chunk_sum = chunk.where(chunk_valid).sum(dim=dim, skipna=True).compute()
-            chunk_count = chunk_valid.sum(dim=dim).compute()
-            chunk_sq_sum = (chunk.where(chunk_valid) ** 2).sum(dim=dim, skipna=True).compute()
-            
-            self.logger.info(f"Chunk {start_idx}-{end_idx}:")
-            self.logger.info(f"  Valid points: {float(chunk_count.mean())}")
-            self.logger.info(f"  Sum: {float(chunk_sum.mean())}")
-            self.logger.info(f"  Sq Sum: {float(chunk_sq_sum.mean())}")
-            
-            if running_sum is None:
-                running_sum = chunk_sum
-                running_sq_sum = chunk_sq_sum
-            else:
-                running_sum += chunk_sum
-                running_sq_sum += chunk_sq_sum
-            running_count += chunk_count
 
-        self.logger.info("Final accumulation:")
-        self.logger.info(f"  Total sum: {float(running_sum.mean())}")
-        self.logger.info(f"  Total count: {float(running_count.mean())}")
-        self.logger.info(f"  Total sq sum: {float(running_sq_sum.mean())}")
+        MISSING_VALUE = 9.96921e+36
+        data_masked = data_array.where(data_array != MISSING_VALUE)
+        
+        mean = data_masked.mean(dim=dim)
+        std = data_masked.std(dim=dim)
 
-        mean = running_sum / running_count
-        variance = (running_sq_sum / running_count) - (mean ** 2)
-        std = xr.where(variance > 0, np.sqrt(variance), 0)
+        mean = mean.compute()
+        std = std.compute()
+        
+        self.logger.info(f"Computed statistics for {var_name}:")
+        self.logger.info(f"Mean shape: {mean.shape}")
+        self.logger.info(f"Mean overall: {float(mean.mean())}")
+        self.logger.info(f"Mean range: {float(mean.min())} to {float(mean.max())}")
+        self.logger.info(f"Std range: {float(std.min())} to {float(std.max())}")
 
-        dims = [d for d in data_array.dims if d != dim]
-        coords = {k: v for k, v in data_array.coords.items() if k != dim}
-        if "time" in coords:
-            coords.pop("time")
-        
-        mean_da = xr.DataArray(mean, dims=dims, coords=coords)
-        std_da = xr.DataArray(std, dims=dims, coords=coords)
-        
-        self.logger.info("Final statistics:")
-        self.logger.info(f"  Mean: {float(mean_da.mean())}")
-        self.logger.info(f"  Std: {float(std_da.mean())}")
-        
-        np.save(cache_file, np.array([mean_da.values, std_da.values]))
-        return mean_da, std_da
+        np.save(cache_file, np.array([mean.values, std.values]))
+                
+        return mean, std
 
     def get_spatial_data(self):
         return (
@@ -313,7 +242,10 @@ class OceanDataProcessor:
             'vnt_chunks': self.vnt_ds["VNT"].chunks
         }
 
-    def calculate_heat_transport(self, latitude_index):
+    def calculate_heat_transport(self, latitude_index=None):
+        if latitude_index is None:
+            latitude_index = self.reference_latitude
+            
         cache_file = Path(f'/scratch/user/aaupadhy/college/RA/final_data/cache/heat_transport_lat{latitude_index}.npy')
         cache_mean_file = Path(f'/scratch/user/aaupadhy/college/RA/final_data/cache/heat_transport_lat{latitude_index}_mean.npy')
         
@@ -328,10 +260,9 @@ class OceanDataProcessor:
                 return heat_transport, mean_transport
             except Exception as e:
                 self.logger.warning(f"Failed to load cached data: {str(e)}. Recomputing...")
-                
+        
         try:
             self.logger.info(f"Calculating heat transport for latitude index {latitude_index}")
-            valid_mask_slice = self.valid_mask[latitude_index]
             
             vnt = self.vnt_ds["VNT"].isel(nlat=latitude_index)
             self.logger.info(f"VNT shape after lat selection: {vnt.shape}")
@@ -339,29 +270,25 @@ class OceanDataProcessor:
             tarea = self.vnt_ds["TAREA"].isel(nlat=latitude_index)
             self.logger.info(f"TAREA shape: {tarea.shape}")
             
-            dz = self.vnt_ds["dz"].isel(nlat=latitude_index)
+            dz = self.vnt_ds["dz"]
             self.logger.info(f"dz shape: {dz.shape}")
-            
-            # Calculate in smaller chunks
+
             chunk_size = 60
             total_times = vnt.shape[0]
             heat_transport_list = []
             
             for start_idx in range(0, total_times, chunk_size):
                 end_idx = min(start_idx + chunk_size, total_times)
-                
                 vnt_chunk = vnt.isel(time=slice(start_idx, end_idx))
-                tarea_chunk = tarea
-                dz_chunk = dz
                 
                 chunk_transport = (
-                    vnt_chunk * 
-                    tarea_chunk * self.tarea_conversion * 
-                    dz_chunk * self.dz_conversion
-                ).where(valid_mask_slice).sum(dim=['z_t', 'nlon']).compute()
+                    vnt_chunk *
+                    tarea * self.tarea_conversion *
+                    dz * self.dz_conversion
+                ).sum(dim=['z_t', 'nlon']).compute()
                 
                 heat_transport_list.append(chunk_transport)
-                
+            
             heat_transport = np.concatenate(heat_transport_list)
             mean_transport = float(np.mean(heat_transport))
             
@@ -373,7 +300,7 @@ class OceanDataProcessor:
             self.logger.info(f"  Mean: {mean_transport:.2e}")
             
             return heat_transport, mean_transport
-        
+            
         except Exception as e:
             self.logger.error(f"Error calculating heat transport: {str(e)}")
             raise
@@ -382,23 +309,42 @@ class OceanDataProcessor:
 
 class OceanDataset(Dataset):
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean,
-                 ssh_mean, ssh_std, sst_mean, sst_std, shape, valid_mask):
+                ssh_mean, ssh_std, sst_mean, sst_std, shape):
         self.ssh = ssh
         self.sst = sst
-        if isinstance(heat_transport, xr.DataArray):
-            self.heat_transport = heat_transport.values - heat_transport_mean
-        else:
-            self.heat_transport = heat_transport - heat_transport_mean
-        self.ssh_mean = ssh_mean
-        self.ssh_std = ssh_std
-        self.sst_mean = sst_mean
-        self.sst_std = sst_std
+        self.logger = logging.getLogger(__name__)
+        heat_transport_std = np.std(heat_transport - heat_transport_mean)
+        self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
+        
+        self.logger.info(f"Heat Transport statistics after standardization:")
+        self.logger.info(f"  Min: {np.min(self.heat_transport):.2f}")
+        self.logger.info(f"  Max: {np.max(self.heat_transport):.2f}")
+        self.logger.info(f"  Mean: {np.mean(self.heat_transport):.2f}")
+        self.logger.info(f"  Std: {np.std(self.heat_transport):.2f}")
+        
+        self.ssh_mean = ssh_mean.values
+        
+        self.ssh_std = ssh_std.values
+        self.sst_mean = sst_mean.values
+        self.sst_std = sst_std.values
+        self.logger.info(f"SELF SSH MEAN: {self.ssh_mean}")
+        self.logger.info(f"SELF SSH STD: {self.ssh_std}")
+        self.logger.info(f"SELF SST MEAN: {self.sst_mean}")
+        self.logger.info(f"SELF SST STD: {self.ssh_std}")
+        
+        MISSING_VALUE = 9.96921e+36
+        ssh_vals = ssh.isel(time=0).values
+        sst_vals = sst.isel(time=0).values
+        
+        ssh_valid = ssh_vals != MISSING_VALUE
+        sst_valid = sst_vals != MISSING_VALUE
+        self.valid_mask = ssh_valid & sst_valid
+        
         self.length = shape[0]
-        self.valid_mask = valid_mask
 
     def __len__(self):
         return self.length
-
+    
     def __getitem__(self, idx):
         try:
             ssh_data, sst_data = dask.compute(
@@ -406,26 +352,40 @@ class OceanDataset(Dataset):
                 self.sst.isel(time=idx)
             )
             
-            ssh_norm = (ssh_data.values - self.ssh_mean.values) / self.ssh_std.values
-            sst_norm = (sst_data.values - self.sst_mean.values) / self.sst_std.values
+            MISSING_VALUE = 9.96921e+36
+            ssh_vals = ssh_data.values
+            sst_vals = sst_data.values
             
-            ssh_norm = ssh_norm * self.valid_mask.values
-            sst_norm = sst_norm * self.valid_mask.values
+            ssh_valid = (ssh_vals != MISSING_VALUE).reshape(ssh_vals.shape)
+            sst_valid = (sst_vals != MISSING_VALUE).reshape(sst_vals.shape)
+            
+            ssh_norm = np.zeros_like(ssh_vals, dtype=np.float32)
+            sst_norm = np.zeros_like(sst_vals, dtype=np.float32)
+            
+            ssh_norm = np.where(ssh_valid, 
+                            (ssh_vals - self.ssh_mean) / (self.ssh_std + 1e-6),
+                            0)
+            sst_norm = np.where(sst_valid,
+                            (sst_vals - self.sst_mean) / (self.sst_std + 1e-6),
+                            0)
+            
+            ssh_norm = np.clip(ssh_norm, -3, 3)
+            sst_norm = np.clip(sst_norm, -3, 3)
             
             ssh_tensor = torch.from_numpy(ssh_norm).float().unsqueeze(0)
             sst_tensor = torch.from_numpy(sst_norm).float().unsqueeze(0)
-            mask_tensor = torch.from_numpy(self.valid_mask.values).float()
+            mask_tensor = torch.from_numpy(ssh_valid & sst_valid).float()
             
-            ssh_downsampled = F.avg_pool2d(ssh_tensor, kernel_size=2, stride=2)
-            sst_downsampled = F.avg_pool2d(sst_tensor, kernel_size=2, stride=2)
-            mask_downsampled = F.avg_pool2d(mask_tensor.unsqueeze(0), kernel_size=2, stride=2).squeeze(0)
+            ssh_downsampled = F.avg_pool2d(ssh_tensor.unsqueeze(0), kernel_size=2, stride=2).squeeze(0)
+            sst_downsampled = F.avg_pool2d(sst_tensor.unsqueeze(0), kernel_size=2, stride=2).squeeze(0)
+            mask_downsampled = F.avg_pool2d(mask_tensor.unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2).squeeze(0).squeeze(0)
             
             return (
-                ssh_downsampled,
+                ssh_downsampled, 
                 sst_downsampled,
                 mask_downsampled,
                 torch.tensor(self.heat_transport[idx]).float()
             )
         except Exception as e:
-            logging.error(f"Error in __getitem__ at index {idx}: {str(e)}")
+            self.logger.error(f"Error in __getitem__ at index {idx}: {str(e)}")
             raise

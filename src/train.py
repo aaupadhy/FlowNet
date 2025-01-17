@@ -69,17 +69,14 @@ class OceanTrainer:
             self.logger.error(f"Failed to initialize WandB: {str(e)}")
             raise
     
-    def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, 
-                          ssh_mean, ssh_std, sst_mean, sst_std, shape):
-        dataset = OceanDataset(ssh_data, sst_data, heat_transport_data, heat_transport_mean,
-                             ssh_mean, ssh_std, sst_mean, sst_std, shape)
+    def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape):
+        dataset = OceanDataset(ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape)
         
         total_size = len(dataset)
         train_size = int(0.7 * total_size)
         val_size = int(0.15 * total_size)
         test_size = total_size - train_size - val_size
         
-        # Log dataset splits to wandb
         wandb.config.update({
             "train_size": train_size,
             "val_size": val_size,
@@ -138,7 +135,7 @@ class OceanTrainer:
             target = target.to(self.device)
             
             with autocast():
-                output = self.model(ssh, sst, attention_mask)
+                output, attention_maps = self.model(ssh, sst, attention_mask)
                 loss = self.criterion(output, target)
             
             val_loss += loss.item()
@@ -221,7 +218,6 @@ class OceanTrainer:
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Batch size: {self.config['training']['batch_size']}")
         
-        # Log training setup to wandb
         wandb.config.update({
             "accumulation_steps": accumulation_steps,
             "total_batches_per_epoch": total_batches,
@@ -252,14 +248,14 @@ class OceanTrainer:
                 except Exception as e:
                     self.logger.error(f"Error loading data: {e}")
                     raise
-
                 
-                with autocast():
-                    output = self.model(ssh, sst, attention_mask)
-                    self.logger.info(f"Batch {i} forward pass complete")
-                    loss = self.criterion(output, target)
-                    loss = loss / accumulation_steps
-                self.scaler.scale(loss).backward()
+                output, attention_maps = self.model(ssh, sst, attention_mask)
+                self.logger.info(f"Output: {output}")
+                self.logger.info(f"Batch {i} forward pass complete")
+                loss = self.criterion(output, target)
+                loss = loss / accumulation_steps
+                    
+                loss.backward()
                 
                 batch_loss = loss.item() * accumulation_steps
                 predictions = output.detach().cpu().numpy()
@@ -274,14 +270,9 @@ class OceanTrainer:
                         f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
                     )
                 
-                
-                
                 if (i + 1) % accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip'])
-                    
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                 
                 epoch_loss += batch_loss
@@ -323,7 +314,6 @@ class OceanTrainer:
                 f"Learning Rate: {self.scheduler.get_last_lr()[0]:.2e}\n"
             )
             
-            # Log epoch metrics to wandb
             wandb.log({
                 'epoch': epoch,
                 'epoch/train_loss': epoch_loss,
@@ -390,7 +380,6 @@ class OceanTrainer:
                 self.save_checkpoint(epoch, metrics, is_best=True)
             else:
                 patience_counter += 1
-                
                 if epoch % self.config['training']['save_freq'] == 0:
                     self.save_checkpoint(epoch, metrics)
             
@@ -467,7 +456,6 @@ class OceanTrainer:
         for k, v in metrics.items():
             self.logger.info(f"{k}: {v:.4f}")
         
-        # Log test results to wandb
         wandb.run.summary.update({
             'test/loss': metrics['test_loss'],
             'test/loss_std': metrics['test_loss_std'],
@@ -476,10 +464,8 @@ class OceanTrainer:
             'test/mae': metrics['test_mae']
         })
         
-        # Save final visualizations
         viz = OceanVisualizer(self.save_dir)
         
-        # Save predictions plot
         final_predictions_path = self.save_dir / 'final_predictions.png'
         viz.plot_predictions(
             predictions, 
@@ -487,7 +473,6 @@ class OceanTrainer:
             save_path='final_predictions'
         )
         
-        # Save attention maps
         tlat = self.config.get('data', {}).get('tlat', None)
         tlong = self.config.get('data', {}).get('tlong', None)
         
@@ -498,13 +483,11 @@ class OceanTrainer:
             save_path='final_attention_maps'
         )
         
-        # Log final visualizations to wandb
         wandb.log({
             "final_predictions": wandb.Image(str(final_predictions_path)),
             "final_attention_maps": wandb.Image(str(final_attention_path))
         })
         
-        # Save detailed results
         results = {
             'metrics': metrics,
             'predictions': predictions.tolist(),
@@ -554,7 +537,6 @@ class OceanTrainer:
                     
                     prof.step()
             
-            # Save profiling results
             profile_table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
             with open(profile_dir / 'profile_summary.txt', 'w') as f:
                 f.write(profile_table)

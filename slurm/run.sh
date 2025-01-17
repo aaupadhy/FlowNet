@@ -26,11 +26,9 @@ echo "PYTHONPATH: $PYTHONPATH"
 
 
 export DASK_DASHBOARD_PORT=8787
-COMPUTE_NODE=$(hostname -s)  # Get short hostname (e.g., g077)
+COMPUTE_NODE=$(hostname -s)
 
-echo "To access Dask dashboard, run this command on your local machine:"
 echo "ssh -N -L 8787:${COMPUTE_NODE}:8787 aaupadhy@grace.hprc.tamu.edu"
-echo "Then visit http://localhost:8787 in your browser"
 
 source ~/.bashrc
 conda activate ML
@@ -47,5 +45,4 @@ nvidia-smi
 
 python $PROJECT_DIR/main.py --mode all
 
-# Print job completion info
 echo "Job finished at $(date)"
