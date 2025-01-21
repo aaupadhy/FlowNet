@@ -70,6 +70,7 @@ class OceanTrainer:
             raise
     
     def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape):
+        
         dataset = OceanDataset(ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape)
         
         total_size = len(dataset)

@@ -308,12 +308,14 @@ class OceanDataProcessor:
             self._cleanup_memory()
 
 class OceanDataset(Dataset):
+    
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean,
                 ssh_mean, ssh_std, sst_mean, sst_std, shape):
+        
         self.ssh = ssh
         self.sst = sst
         self.logger = logging.getLogger(__name__)
-        heat_transport_std = np.std(heat_transport - heat_transport_mean)
+        heat_transport_std = np.std(heat_transport)
         self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
         
         self.logger.info(f"Heat Transport statistics after standardization:")
