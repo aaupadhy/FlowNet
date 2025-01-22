@@ -54,15 +54,15 @@ visualization:
     sst: "cmo.thermal"         
     attention: "viridis"      
 training:
-    d_model: 64
+    d_model: 16
     n_heads: 8
     num_layers: 4
-    dim_feedforward: 128
+    dim_feedforward: 32
     dropout: 0.1
     patience: 10
     batch_size: 8
     learning_rate: 0.0001
-    epochs: 10
+    epochs: 1
     early_stopping_patience: 10
     validation_split: 0.15
     test_split: 0.15
