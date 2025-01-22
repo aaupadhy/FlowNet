@@ -25,7 +25,7 @@ class OceanDataProcessor:
 
     def _cleanup_memory(self):
         gc.collect()
-        if hasattr(self, 'client'):
+        if hasattr(self, 'client'): 
             self.client.cancel(self.client.get_current_task())
             
         torch.cuda.empty_cache()
@@ -156,7 +156,7 @@ class OceanDataProcessor:
             try:
                 ref_lat_idx = np.load(cache_file)
                 tlat = self.vnt_ds['TLAT'][0]
-                actual_lat = float(tlat[ref_lat_idx].mean())
+                actual_lat = tlat[ref_lat_idx]
                 self.logger.info(f"Loaded cached reference latitude index {ref_lat_idx} corresponding to {actual_lat:.2f}°N")
                 return ref_lat_idx
             except Exception as e:
@@ -164,23 +164,23 @@ class OceanDataProcessor:
         
         try:
             tlat = self.vnt_ds['TLAT'][0]
-            self.logger.info(f"TLAT: {tlat}")
-            lat_mask = (tlat >= 39.9) & (tlat <= 40.1)
+            lat_mask = (self.vnt_ds['TLAT'] >= 39.9) & (self.vnt_ds['TLAT'] <= 40.1)
             lat_mask = lat_mask.compute()
-            
-            lat_indices = np.where(lat_mask)
-            if len(lat_indices) == 0:
+            self.logger.info(f"Lat Mask: {lat_mask}")
+            row_indices, col_indicess = np.where(lat_mask)
+            if len(row_indices) == 0:
                 raise ValueError("No points found at 40°N latitude")
 
-            self.logger.info(f"Lat indices: {lat_indices}")
+            self.logger.info(f"Lat indices: {row_indices}")
             
-            ref_lat_idx = int(np.median(lat_indices))
-            actual_lat = float(tlat[ref_lat_idx].mean())
+            ref_lat_idx = len(row_indices)//2
+            self.logger.info(f"TLAT SHAPE: {tlat.shape}")
+            actual_lat = tlat[ref_lat_idx]
             
             np.save(cache_file, ref_lat_idx)
             
             self.logger.info(f"Found and cached reference latitude index {ref_lat_idx} corresponding to {actual_lat:.2f}°N")
-            self.logger.info(f"Number of points found at ~40°N: {len(lat_indices)}")
+            self.logger.info(f"Number of points found at ~40°N: {len(row_indices)}")
             
             return ref_lat_idx
 
@@ -197,30 +197,36 @@ class OceanDataProcessor:
                 std_da = xr.DataArray(stats[1])
                 self.logger.info(f"Loaded cached statistics for {var_name}")
                 return mean_da, std_da
-            
             except Exception as e:
                 self.logger.warning(f"Failed to load cached stats: {str(e)}. Recomputing...")
-
+        
         self.logger.info(f"Computing statistics for {var_name}")
         self.logger.info(f"Input shape: {data_array.shape}")
-
-        MISSING_VALUE = 9.96921e+36
-        data_masked = data_array.where(data_array != MISSING_VALUE)
         
-        mean = data_masked.mean(dim=dim)
-        std = data_masked.std(dim=dim)
-
+        MISSING_VALUE = 9.96921e+36
+        data_masked = data_array.where(
+            (data_array != MISSING_VALUE) & 
+            (~np.isnan(data_array))
+        )
+        
+        mean = data_masked.mean(dim=dim, skipna=True)
+        std = data_masked.std(dim=dim, skipna=True)
+        
+        mean = mean.fillna(-1)
+        std = std.fillna(0)
+        
         mean = mean.compute()
         std = std.compute()
         
+        valid_mean = mean.where(mean != -1)
+        valid_std = std.where(std != 0)
+        
         self.logger.info(f"Computed statistics for {var_name}:")
         self.logger.info(f"Mean shape: {mean.shape}")
-        self.logger.info(f"Mean overall: {float(mean.mean())}")
-        self.logger.info(f"Mean range: {float(mean.min())} to {float(mean.max())}")
-        self.logger.info(f"Std range: {float(std.min())} to {float(std.max())}")
-
+        self.logger.info(f"Valid mean range: {float(valid_mean.min())} to {float(valid_mean.max())}")
+        self.logger.info(f"Valid std range: {float(valid_std.min())} to {float(valid_std.max())}")
+        
         np.save(cache_file, np.array([mean.values, std.values]))
-                
         return mean, std
 
     def get_spatial_data(self):
@@ -330,8 +336,10 @@ class OceanDataset(Dataset):
         self.sst_mean = sst_mean.values
         self.sst_std = sst_std.values
         self.logger.info(f"SELF SSH MEAN: {self.ssh_mean}")
+        self.logger.info(f"SELF SSH MEAN: {self.ssh_mean.shape}")
         self.logger.info(f"SELF SSH STD: {self.ssh_std}")
         self.logger.info(f"SELF SST MEAN: {self.sst_mean}")
+        self.logger.info(f"SELF SSH MEAN: {self.sst_mean.shape}")
         self.logger.info(f"SELF SST STD: {self.ssh_std}")
         
         MISSING_VALUE = 9.96921e+36
