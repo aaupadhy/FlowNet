@@ -43,23 +43,43 @@ class OceanVisualizer:
                 "dpi": self.dpi,
                 "output_dir": str(self.output_dir)
             }
-        })
+        }, allow_val_change=True)
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
         n_layers = len(attention_maps)
         n_heads = attention_maps[0].shape[1]
+        
+        # Get spatial dimensions from input coordinates
+        h, w = len(tlat), len(tlong)
+        
+        # Calculate downsampling factor, ensure minimum of 1
+        total_elements = attention_maps[0][0, 0].size
+        downsample_factor = max(1, int(np.sqrt(total_elements / (h * w))))
+        
+        # Ensure coordinates are numpy arrays
+        tlat = tlat.values if hasattr(tlat, 'values') else tlat
+        tlong = tlong.values if hasattr(tlong, 'values') else tlong
+        
+        # Downsample coordinates
+        tlat_ds = tlat[::downsample_factor]
+        tlong_ds = tlong[::downsample_factor]
+        
+        # Create figure
         fig, axes = plt.subplots(n_layers, n_heads,
                                 figsize=(4*n_heads, 4*n_layers),
                                 subplot_kw={'projection': ccrs.PlateCarree()})
+        axes = np.atleast_2d(axes)
 
         for layer_idx, layer_attn in enumerate(attention_maps):
             for head_idx in range(n_heads):
                 ax = axes[layer_idx, head_idx]
-                attention = layer_attn[0, head_idx].reshape(len(tlat), len(tlong))
+                attention = layer_attn[0, head_idx].reshape(len(tlat_ds), len(tlong_ds))
+                
                 ax.coastlines(resolution='50m')
                 ax.add_feature(cfeature.BORDERS, linestyle=':')
+                
                 im = ax.pcolormesh(
-                    tlong, tlat, attention,
+                    tlong_ds, tlat_ds, attention,
                     transform=ccrs.PlateCarree(),
                     cmap='viridis',
                     vmin=0,
@@ -76,44 +96,6 @@ class OceanVisualizer:
             wandb.log({
                 f"attention_maps/{Path(save_path).stem}": wandb.Image(str(save_path))
             })
-            self.logger.info(f"Saved attention maps to {save_path}")
-
-    def plot_predictions(self, predictions, targets, time_indices=None, save_path=None):
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=self.fig_size)
-        if time_indices is None:
-            time_indices = np.arange(len(predictions))
-        
-        ax1.plot(time_indices, targets, label='Actual', alpha=0.7)
-        ax1.plot(time_indices, predictions, label='Predicted', alpha=0.7)
-        ax1.set_xlabel('Time Step')
-        ax1.set_ylabel('Heat Transport')
-        ax1.legend()
-        ax1.grid(True)
-
-        r2 = np.corrcoef(targets, predictions)[0,1]**2
-        rmse = np.sqrt(np.mean((targets - predictions) ** 2))
-        
-        ax2.scatter(targets, predictions, alpha=0.5)
-        min_val = min(predictions.min(), targets.min())
-        max_val = max(predictions.max(), targets.max())
-        ax2.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
-        ax2.set_xlabel('Actual Heat Transport')
-        ax2.set_ylabel('Predicted Heat Transport')
-        ax2.legend()
-        ax2.grid(True)
-        ax2.set_title(f'Prediction Scatter (R² = {r2:.3f}, RMSE = {rmse:.3f})')
-
-        plt.tight_layout()
-        if save_path:
-            save_path = self.output_dir / 'predictions' / f"{save_path}.png"
-            plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
-            plt.close()
-            wandb.log({
-                f"predictions/{Path(save_path).stem}": wandb.Image(str(save_path)),
-                f"metrics/r2": r2,
-                f"metrics/rmse": rmse
-            })
-            self.logger.info(f"Saved prediction plot to {save_path}")
 
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
         fig = plt.figure(figsize=self.fig_size)

@@ -1,6 +1,7 @@
 import torch
 import wandb
 from pathlib import Path
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Any
@@ -40,26 +41,37 @@ class TrainingMonitor:
         self.plot_training_curves(metrics, epoch)
     
     def plot_training_curves(self, metrics: Dict[str, float], epoch: int):
-        """Plot and save training curves"""
         fig, axes = plt.subplots(2, 1, figsize=(10, 10))
         
         if not hasattr(self, 'history'):
             self.history = {'epoch': [], 'train_loss': [], 'val_loss': [], 'val_r2': []}
         
-        self.history['epoch'].append(epoch)
-        self.history['train_loss'].append(metrics['train_loss'])
-        self.history['val_loss'].append(metrics['val_loss'])
-        self.history['val_r2'].append(metrics['val_r2'])
-        
-        axes[0].plot(self.history['epoch'], self.history['train_loss'], label='Train Loss')
-        axes[0].plot(self.history['epoch'], self.history['val_loss'], label='Val Loss')
+        self.history['epoch'].append(float(epoch))
+        self.history['train_loss'].append(float(metrics['train_loss']))
+        self.history['val_loss'].append(float(metrics['val_loss']))
+        self.history['val_r2'].append(float(metrics.get('val_r2', 0)))
+
+        epochs = np.array(self.history['epoch'])
+        train_losses = np.array(self.history['train_loss'])
+        val_losses = np.array(self.history['val_loss'])
+        val_r2s = np.array(self.history['val_r2'])
+
+        axes[0].plot(epochs, train_losses, label='Train Loss', marker='o')
+        axes[0].plot(epochs, val_losses, label='Val Loss', marker='o')
         axes[0].set_title('Loss Curves')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].grid(True)
         axes[0].legend()
-        
-        axes[1].plot(self.history['epoch'], self.history['val_r2'], label='Validation R2')
+
+        # Plot R2 curve
+        axes[1].plot(epochs, val_r2s, label='Validation R2', marker='o')
         axes[1].set_title('Validation R2 Score')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('R2 Score')
+        axes[1].grid(True)
         axes[1].legend()
-        
+
         plt.tight_layout()
         plt.savefig(self.save_dir / f'training_curves_epoch_{epoch}.png')
         plt.close()
@@ -69,8 +81,7 @@ class TrainingMonitor:
             'epoch/train_loss': metrics['train_loss'],
             'epoch/val_loss': metrics['val_loss'],
             'epoch/val_r2': metrics['val_r2'],
-            'epoch': epoch,
-            **{f'epoch/{k}': v for k, v in metrics.items() if k not in ['train_loss', 'val_loss', 'val_r2']}
+            'epoch': epoch
         })
     
     def log_model_summary(self, model: torch.nn.Module):

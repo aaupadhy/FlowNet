@@ -35,7 +35,7 @@ class OceanTrainer:
         self.monitor = TrainingMonitor(config, save_dir)
         self.monitor.log_model_summary(model)
         
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.SmoothL1Loss()
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config['training']['learning_rate'],
@@ -44,12 +44,12 @@ class OceanTrainer:
         
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=config['training']['learning_rate'],
+            max_lr=1e-3,
             epochs=config['training']['epochs'],
             steps_per_epoch=1,
             pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=10000.0
+            div_factor=10.0,
+            final_div_factor=1000.0
         )
         self.scaler = torch.cuda.amp.GradScaler()
     
@@ -70,24 +70,37 @@ class OceanTrainer:
             raise
     
     def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape):
+        debug_mode = self.config['training'].get('debug_mode', False)
+        debug_samples = self.config['training'].get('debug_samples', 32)
         
-        dataset = OceanDataset(ssh_data, sst_data, heat_transport_data, heat_transport_mean, ssh_mean, ssh_std, sst_mean, sst_std, shape)
-        
+        dataset = OceanDataset(
+            ssh_data, sst_data, heat_transport_data, heat_transport_mean,
+            ssh_mean, ssh_std, sst_mean, sst_std, shape,
+            debug=debug_mode
+        )
+
         total_size = len(dataset)
-        train_size = int(0.7 * total_size)
-        val_size = int(0.15 * total_size)
-        test_size = total_size - train_size - val_size
         
+        if debug_mode:
+            train_size = debug_samples // 2  # 16 samples
+            val_size = debug_samples // 4    # 8 samples
+            test_size = debug_samples - train_size - val_size  # 8 samples
+        else:
+            train_size = int(0.7 * total_size)
+            val_size = int(0.15 * total_size) 
+            test_size = total_size - train_size - val_size
+
         wandb.config.update({
             "train_size": train_size,
             "val_size": val_size,
-            "test_size": test_size
+            "test_size": test_size,
+            "debug_mode": debug_mode
         })
-        
+
         train_dataset, val_dataset, test_dataset = random_split(
             dataset, [train_size, val_size, test_size]
         )
-        
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config['training']['batch_size'],
@@ -96,12 +109,19 @@ class OceanTrainer:
             num_workers=0
         )
         
-        val_loader = DataLoader(val_dataset, batch_size=self.config['training']['batch_size'])
-        test_loader = DataLoader(test_dataset, batch_size=self.config['training']['batch_size'])
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=self.config['training']['batch_size']
+        )
         
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config['training']['batch_size']
+        )
+
         self.logger.info(f"Created dataloaders - Train: {len(train_loader.dataset)}, "
                         f"Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
-        
+                        
         return train_loader, val_loader, test_loader
     
     @torch.no_grad()
@@ -150,7 +170,7 @@ class OceanTrainer:
         predictions = np.array(predictions)
         targets = np.array(targets)
         
-        r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
+        r2 = 1 - np.sum((targets - predictions) ** 2) / max(np.sum((targets - targets.mean()) ** 2) , 1e-6)
         rmse = np.sqrt(np.mean((targets - predictions) ** 2))
         
         return {
@@ -208,6 +228,7 @@ class OceanTrainer:
                 self.logger.info(f"Removed old checkpoint: {checkpoint}")
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader, start_epoch: int = 0):
+        global_step = 0
         best_val_loss = float('inf')
         patience_counter = 0
         accumulation_steps = 4
@@ -226,6 +247,7 @@ class OceanTrainer:
             "patience": self.config['training']['patience']
         })
         
+        grad_norms = []
         for epoch in range(start_epoch, self.config['training']['epochs']):
             self.model.train()
             epoch_loss = 0
@@ -235,6 +257,7 @@ class OceanTrainer:
             self.logger.info(f"\nEpoch {epoch+1}/{self.config['training']['epochs']}")
             
             for i, (ssh, sst, attention_mask, target) in enumerate(train_loader):
+                global_step += 1
                 torch.cuda.empty_cache()
                 self.logger.info(f"Started training iteration {i}")
                 batch_start = time.time()
@@ -257,6 +280,18 @@ class OceanTrainer:
                 loss = loss / accumulation_steps
                     
                 loss.backward()
+                total_norm = 0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm+= param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                grad_norms.append(total_norm)
+                if i% 100 == 0:
+                    wandb.log({
+                    'gradient/total_norm': total_norm,
+                    'gradient/mean_norm': np.mean(grad_norms[-100:])
+                })
                 
                 batch_loss = loss.item() * accumulation_steps
                 predictions = output.detach().cpu().numpy()
@@ -275,6 +310,7 @@ class OceanTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip'])
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
                 
                 epoch_loss += batch_loss
                 batch_time = time.time() - batch_start
@@ -288,7 +324,7 @@ class OceanTrainer:
                     'batch/throughput': len(ssh) / batch_time,
                     'batch/memory_allocated': torch.cuda.memory_allocated() / 1024**3,
                     'batch/memory_cached': torch.cuda.memory_reserved() / 1024**3
-                }, step=epoch * total_batches + i)
+                }, step=global_step * total_batches + (i+1))
                 
                 self.monitor.log_batch({
                     'loss': batch_loss,
@@ -298,7 +334,6 @@ class OceanTrainer:
                     'memory_allocated': torch.cuda.memory_allocated() / 1024**3
                 }, epoch * total_batches + i)
             
-            self.scheduler.step()
             epoch_loss = epoch_loss / len(train_loader)
             epoch_time = time.time() - epoch_start
             
@@ -351,7 +386,8 @@ class OceanTrainer:
                 attention_save_dir.mkdir(exist_ok=True)
                 viz.plot_attention_maps(
                     attention_maps.detach().cpu().numpy(), 
-                    tlat, tlong,
+                    self.config['data']['tlat'],
+                    self.config['data']['tlong'],
                     save_path=f'attention_maps/epoch_{epoch}'
                 )
                 

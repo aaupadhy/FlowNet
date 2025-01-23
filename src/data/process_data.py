@@ -474,7 +474,7 @@ class OceanDataset(Dataset):
     """Dataset class for ocean data with standardization."""
     
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean,
-                 ssh_mean, ssh_std, sst_mean, sst_std, shape):
+                 ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False):
         """
         Initialize dataset with raw data and statistics for normalization.
         
@@ -489,10 +489,20 @@ class OceanDataset(Dataset):
             sst_std: Global std for SST (scalar)
             shape: Shape of the data arrays
         """
-        self.ssh = ssh
-        self.sst = sst
+
         self.logger = logging.getLogger(__name__)
-        
+       
+        if debug:
+            self.ssh = ssh.isel(time=slice(0, 32))
+            self.sst = sst.isel(time=slice(0, 32))
+            self.heat_transport = heat_transport[:32]
+            self.length = 32
+        else:
+            self.ssh = ssh
+            self.sst = sst
+            self.length = shape[0]
+            
+
         # Standardize heat transport
         heat_transport_std = np.std(heat_transport)
         self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
@@ -523,7 +533,7 @@ class OceanDataset(Dataset):
         sst_valid = sst_vals != self.MISSING_VALUE
         self.valid_mask = ssh_valid & sst_valid
         
-        self.length = shape[0]
+        
 
     def analyze_distributions(self, ssh, sst):
         """

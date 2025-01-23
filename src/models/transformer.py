@@ -59,7 +59,7 @@ class MultiModalFusion(nn.Module):
         sst_proj = self.sst_proj(sst_feat)
         log_tensor_stats(sst_proj, "SST after projection")
         
-        fused = self.fusion(torch.cat([ssh_proj, sst_proj], dim=-1))
+        fused = self.fusion(torch.cat([ssh_proj, sst_proj], dim=-1)) + 0.1*(ssh_proj + sst_proj)
         log_tensor_stats(fused, "After fusion")
         
         return fused
@@ -135,7 +135,9 @@ class OceanTransformer(nn.Module):
            nn.LayerNorm(d_model // 2),
            nn.Dropout(dropout)
        )
-       self.fc = nn.Linear(d_model // 2, 1)
+       self.fc = nn.Sequential(nn.Linear(d_model // 2, d_model // 4),
+        nn.ReLU(),
+        nn.Linear(d_model // 4, 1))
 
    def _get_transformer_output_and_attention(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
        attention_maps = []

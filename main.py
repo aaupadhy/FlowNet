@@ -139,7 +139,10 @@ def train_model(config: dict, data_processor: OceanDataProcessor) -> None:
             
             with dask_monitor.monitor_operation("training_data_preparation"):
                 ssh, sst, tlat , tlong = data_processor.get_spatial_data()
-                
+                config['data'].update({
+                'tlat': tlat.compute(),
+                'tlong': tlong.compute()
+                })
                 heat_transport, heat_transport_mean = data_processor.calculate_heat_transport()
                 
                 logger.info(f"Using heat transport mean: {heat_transport_mean}")

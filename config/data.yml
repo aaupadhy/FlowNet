@@ -54,6 +54,8 @@ visualization:
     sst: "cmo.thermal"         
     attention: "viridis"      
 training:
+    debug_mode: true
+    debug_samples: 32
     d_model: 16
     n_heads: 8
     num_layers: 4
