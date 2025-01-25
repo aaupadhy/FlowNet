@@ -78,48 +78,48 @@ def load_config(config_path: str) -> dict:
 
 def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
     logger.info("Starting data analysis phase")
-    
     try:
         with timing_block("Data Analysis"):
             with dask_monitor.monitor_operation("spatial_data_loading"):
                 ssh, sst, tlat, tlong = data_processor.get_spatial_data()
-                
                 visualizer = OceanVisualizer(
                     output_dir=config['paths']['output_dir'],
                     fig_size=tuple(config['visualization']['fig_size']),
                     dpi=config['visualization']['dpi']
                 )
                 
+                logger.info("Analyzing spatial coverage...")
                 ocean_monitor.analyze_spatial_coverage(ssh, "SSH")
                 ocean_monitor.analyze_spatial_coverage(sst, "SST")
+                
+                logger.info("Analyzing temporal patterns...")
                 ocean_monitor.analyze_temporal_patterns(ssh, "SSH")
                 ocean_monitor.analyze_temporal_patterns(sst, "SST")
                 
+                logger.info("Validating data...")
                 ocean_monitor.validate_data(ssh, "SSH")
                 ocean_monitor.validate_data(sst, "SST")
             
-            if config['dask'].get('chunk_optimization', True):
-                ssh = dask_monitor.auto_optimize_chunks(ssh, "SSH")
-                sst = dask_monitor.auto_optimize_chunks(sst, "SST")
-            
+            logger.info("Saving initial visualizations...")
             visualizer.plot_spatial_pattern(
                 ssh.isel(time=0).compute(),
                 tlat,
                 tlong,
                 "SSH Pattern",
-                save_path='ssh_pattern'
+                save_path='initial_ssh_pattern'
             )
+            
             visualizer.plot_spatial_pattern(
                 sst.isel(time=0).compute(),
                 tlat,
                 tlong,
                 "SST Pattern",
-                save_path='sst_pattern'
+                save_path='initial_sst_pattern'
             )
             
-            ocean_monitor.plot_spatial_coverage(ssh, "SSH")
-            ocean_monitor.plot_spatial_coverage(sst, "SST")
+            logger.info("Creating performance dashboard...")
             ocean_monitor.create_performance_dashboard()
+            ocean_monitor.save_metrics()
             
             logger.info("Analysis phase completed successfully")
             return ssh, sst

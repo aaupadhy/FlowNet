@@ -146,17 +146,16 @@ class OceanDataMonitor:
         self.logger.info("Performance dashboard created")
     
     def save_metrics(self):
-        """Save all monitoring metrics"""
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         
-        # Save each metric type
         for metric_type, metrics in self.metrics.items():
-            if metrics:  # Only save if we have metrics
+            if metrics:
                 df = pd.DataFrame(metrics)
                 save_path = self.metrics_dir / f'{metric_type}_metrics_{timestamp}.csv'
+                self.metrics_dir.mkdir(parents=True, exist_ok=True)
                 df.to_csv(save_path, index=False)
+                self.logger.info(f"Saved {metric_type} metrics to {save_path}")
         
-        # Create summary report
         summary = {
             'timestamp': timestamp,
             'metrics_collected': list(self.metrics.keys()),
@@ -167,11 +166,11 @@ class OceanDataMonitor:
             ))
         }
         
-        # Save summary
-        with open(self.metrics_dir / f'summary_{timestamp}.json', 'w') as f:
+        summary_path = self.metrics_dir / f'summary_{timestamp}.json'
+        with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
-        
-        self.logger.info(f"Metrics saved to {self.metrics_dir}")
+            
+        self.logger.info(f"Metrics summary saved to {summary_path}")
     
     def create_monitoring_report(self):
         """Create comprehensive monitoring report"""
