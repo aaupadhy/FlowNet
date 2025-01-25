@@ -154,6 +154,9 @@ class DaskManager:
             self.logger.info(f"Memory per worker: {mem_per_worker}GB")
             
             dask.config.set({
+                'distributed.comm.timeouts.connect': '30s',
+                'distributed.comm.timeouts.tcp': '30s',
+                'distributed.nanny.daemon.exit-on-closed-stream': False,
                 'distributed.worker.memory.target': 0.6,    # Use 60% memory before spilling
                 'distributed.worker.memory.spill': 0.70,    # Spill at 70%
                 'distributed.worker.memory.pause': 0.75,    # Pause at 75%

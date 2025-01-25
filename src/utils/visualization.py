@@ -7,7 +7,9 @@ import xarray as xr
 from pathlib import Path
 import cmocean
 import logging
+import torch
 from datetime import datetime
+from typing import Optional, Tuple, Union
 import matplotlib.colors as colors
 import wandb
 
@@ -45,50 +47,54 @@ class OceanVisualizer:
             }
         }, allow_val_change=True)
 
-    def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
+
+    def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None) -> Optional[plt.Figure]:
+        
         n_layers = len(attention_maps)
         n_heads = attention_maps[0].shape[1]
+        attention_size = attention_maps[0][0, 0].shape[0]
         
-        # Get spatial dimensions from input coordinates
-        h, w = len(tlat), len(tlong)
+        grid_size = int(np.sqrt(attention_size))
+        if grid_size * grid_size != attention_size:
+            grid_size = int(np.ceil(np.sqrt(attention_size)))
         
-        # Calculate downsampling factor, ensure minimum of 1
-        total_elements = attention_maps[0][0, 0].size
-        downsample_factor = max(1, int(np.sqrt(total_elements / (h * w))))
-        
-        # Ensure coordinates are numpy arrays
         tlat = tlat.values if hasattr(tlat, 'values') else tlat
         tlong = tlong.values if hasattr(tlong, 'values') else tlong
         
-        # Downsample coordinates
-        tlat_ds = tlat[::downsample_factor]
-        tlong_ds = tlong[::downsample_factor]
+        lat_range = np.linspace(tlat.min(), tlat.max(), grid_size)
+        lon_range = np.linspace(tlong.min(), tlong.max(), grid_size)
         
-        # Create figure
         fig, axes = plt.subplots(n_layers, n_heads,
                                 figsize=(4*n_heads, 4*n_layers),
                                 subplot_kw={'projection': ccrs.PlateCarree()})
         axes = np.atleast_2d(axes)
-
+        
         for layer_idx, layer_attn in enumerate(attention_maps):
             for head_idx in range(n_heads):
                 ax = axes[layer_idx, head_idx]
-                attention = layer_attn[0, head_idx].reshape(len(tlat_ds), len(tlong_ds))
+                
+                attention = layer_attn[0, head_idx]
+                padded_attention = np.zeros((grid_size * grid_size))
+                padded_attention[:attention_size] = attention
+                attention_grid = padded_attention.reshape(grid_size, grid_size)
                 
                 ax.coastlines(resolution='50m')
                 ax.add_feature(cfeature.BORDERS, linestyle=':')
                 
-                im = ax.pcolormesh(
-                    tlong_ds, tlat_ds, attention,
+                im = ax.imshow(
+                    attention_grid,
+                    extent=[lon_range[0], lon_range[-1], lat_range[0], lat_range[-1]],
                     transform=ccrs.PlateCarree(),
                     cmap='viridis',
-                    vmin=0,
-                    vmax=attention.max()
+                    aspect='auto',
+                    origin='lower'
                 )
+                
                 ax.set_title(f'Layer {layer_idx+1}, Head {head_idx+1}')
                 plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.05)
-
+        
         plt.tight_layout()
+        
         if save_path:
             save_path = self.output_dir / 'attention_maps' / f"{save_path}.png"
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
@@ -96,6 +102,10 @@ class OceanVisualizer:
             wandb.log({
                 f"attention_maps/{Path(save_path).stem}": wandb.Image(str(save_path))
             })
+            return None
+        
+        return fig
+
 
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
         fig = plt.figure(figsize=self.fig_size)
