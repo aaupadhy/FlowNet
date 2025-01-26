@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:a100:2
 #SBATCH --mem=140G
-#SBATCH --time=48:00:00
+#SBATCH --time=15:00:00
 
 module purge
 module load WebProxy
@@ -33,6 +33,6 @@ echo "Job started at $(date)"
 echo "Running on ${COMPUTE_NODE}.grace.hprc.tamu.edu"
 nvidia-smi
 
-torchrun --rdzv_backend=c10d --standalone --nproc_per_node=4 main.py --mode all
+torchrun --rdzv_backend=c10d --standalone --nproc_per_node=2 main.py --mode all
 
 echo "Job finished at $(date)"

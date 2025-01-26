@@ -131,138 +131,142 @@ def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
         logger.error(traceback.format_exc())
         raise
 
-def train_model(config: dict, data_processor: OceanDataProcessor) -> None:
-    torch.cuda.set_per_process_memory_fraction(0.9)
-    torch.backends.cuda.max_split_size_mb = 512
-    logger.info("Starting model training phase")
+def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: int):
+    """Train the model with distributed support."""
+    torch.cuda.set_device(local_rank)
+    torch.backends.cudnn.benchmark = True
     
     try:
-        with timing_block("Model Training"):
-            
-            with dask_monitor.monitor_operation("training_data_preparation"):
-                ssh, sst, tlat , tlong = data_processor.get_spatial_data()
-                config['data'].update({
+        # Get heat transport data
+        with dask_monitor.monitor_operation("training_data_preparation"):
+            ssh, sst, tlat, tlong = data_processor.get_spatial_data()
+            config['data'].update({
                 'tlat': tlat.compute(),
                 'tlong': tlong.compute()
-                })
-                heat_transport, heat_transport_mean = data_processor.calculate_heat_transport()
-                
-                logger.info(f"Using heat transport mean: {heat_transport_mean}")
-            
-            torch.backends.cudnn.benchmark = True
-            
-            spatial_size = (data_processor.shape[1], data_processor.shape[2])
-            
-            model = OceanTransformer(
-                spatial_size=spatial_size,
-                d_model=config['training']['d_model'],
-                nhead=config['training']['n_heads'],
-                num_layers=config['training']['num_layers'],
-                dim_feedforward=config['training']['dim_feedforward'],
-                dropout=config['training']['dropout']
-            ).cuda()
-            
-            if hasattr(torch, 'compile'):
-                model = torch.compile(model, backend='eager')
-            
-            trainer = OceanTrainer(
-                model=model,
-                config=config,
-                save_dir=Path(config['paths']['model_dir']),
-                device='cuda'
-            )
-            
-            train_loader, val_loader, test_loader = trainer.create_dataloaders(
-                ssh, 
-                sst,
-                heat_transport,
-                heat_transport_mean,
-                data_processor.ssh_mean,
-                data_processor.ssh_std,
-                data_processor.sst_mean,
-                data_processor.sst_std,
-                data_processor.shape
-            )
-            
-            checkpoint_path = Path(config['paths']['model_dir']) / 'checkpoints/latest_checkpoint.pt'
-            start_epoch = 0
-            if checkpoint_path.exists():
-                start_epoch, metrics = trainer.resume_from_checkpoint(str(checkpoint_path))
-                logger.info(f"Resumed from epoch {start_epoch} with metrics: {metrics}")
-            
-            # trainer.profile_model(train_loader)
-            
-            trainer.train(train_loader, val_loader, start_epoch=start_epoch)
-            
-            logger.info("Generating predictions and attention visualizations")
-            test_metrics, predictions, attention_maps = trainer.evaluate(
-                test_loader, 
-                heat_transport_mean
-            )
-            
-            visualizer = OceanVisualizer(output_dir=config['paths']['output_dir'])
-            
-            attention_maps = attention_maps.mean(dim=1)
-            attention_maps = attention_maps.reshape((-1, len(ssh.nlat), len(ssh.nlon)))
-            
-            visualizer.plot_attention_maps(
-                attention_maps,
-                ssh.nlat, 
-                ssh.nlon, 
-                save_path='attention_maps'
-            )
-            
-            visualizer.plot_predictions(
-                predictions, 
-                heat_transport,
-                time_indices=np.arange(len(predictions)),
-                save_path='predictions'
-            )
-            
-            logger.info(f"Test metrics: {test_metrics}")
-            
-            results = {
-                'test_metrics': test_metrics,
-                'predictions': predictions.tolist(),
-                'attention_maps': attention_maps.cpu().numpy().tolist()
-            }
-            
-            with open(Path(config['paths']['output_dir']) / 'results.json', 'w') as f:
-                json.dump(results, f)
-            
+            })
+            heat_transport, heat_transport_mean = data_processor.calculate_heat_transport()
+            logger.info(f"Using heat transport mean: {heat_transport_mean}")
+
+        # Model setup
+        spatial_size = (data_processor.shape[1], data_processor.shape[2])
+        model = OceanTransformer(
+            spatial_size=spatial_size,
+            d_model=config['training']['d_model'],
+            nhead=config['training']['n_heads'],
+            num_layers=config['training']['num_layers'],
+            dim_feedforward=config['training']['dim_feedforward'],
+            dropout=config['training']['dropout']
+        )
+
+        if hasattr(torch, 'compile'):
+            model = torch.compile(model, backend='eager')
+
+        trainer = OceanTrainer(
+            model=model,
+            config=config,
+            save_dir=Path(config['paths']['model_dir']),
+            device='cuda'
+        )
+
+        # Create dataloaders
+        train_loader, val_loader, test_loader = trainer.create_dataloaders(
+            ssh,
+            sst,
+            heat_transport,
+            heat_transport_mean,
+            data_processor.ssh_mean,
+            data_processor.ssh_std,
+            data_processor.sst_mean,
+            data_processor.sst_std,
+            data_processor.shape
+        )
+
+        checkpoint_path = Path(config['paths']['model_dir']) / 'checkpoints/latest_checkpoint.pt'
+        start_epoch = 0
+        if checkpoint_path.exists():
+            start_epoch, metrics = trainer.resume_from_checkpoint(str(checkpoint_path))
+            logger.info(f"Resumed from epoch {start_epoch} with metrics: {metrics}")
+
+        trainer.train(train_loader, val_loader, start_epoch=start_epoch)
+
+        logger.info("Generating predictions and attention visualizations")
+        test_metrics, predictions, attention_maps = trainer.evaluate(
+            test_loader,
+            heat_transport_mean
+        )
+
+        # Create visualizations
+        visualizer = OceanVisualizer(output_dir=config['paths']['output_dir'])
+        attention_maps = attention_maps.mean(dim=1)
+        attention_maps = attention_maps.reshape((-1, len(ssh.nlat), len(ssh.nlon)))
+        
+        visualizer.plot_attention_maps(
+            attention_maps,
+            ssh.nlat,
+            ssh.nlon,
+            save_path='attention_maps'
+        )
+
+        visualizer.plot_predictions(
+            predictions,
+            heat_transport,
+            time_indices=np.arange(len(predictions)),
+            save_path='predictions'
+        )
+
+        logger.info(f"Test metrics: {test_metrics}")
+        
+        results = {
+            'test_metrics': test_metrics,
+            'predictions': predictions.tolist(),
+            'attention_maps': attention_maps.cpu().numpy().tolist()
+        }
+        
+        results_path = Path(config['paths']['output_dir']) / 'results.json'
+        with open(results_path, 'w') as f:
+            json.dump(results, f)
+
     except Exception as e:
         logger.error(f"Error during training: {str(e)}")
         logger.error(traceback.format_exc())
         raise
 
 def main():
-    local_rank = int(os.environ["LOCAL_RANK"])
     parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
     parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
     parser.add_argument('--mode', choices=['analyze', 'train', 'all'], default='train',
                       help='Mode of operation')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     args = parser.parse_args()
 
+    # Set local rank from environment variable if available
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    
     try:
         config = load_config(args.config)
         setup_directories(config)
-
-        if torch.cuda.device_count() > 1 and not dist.is_initialized():
-            torch.cuda.set_device(local_rank)
-            dist.init_process_group(backend='nccl')
-
+        
+        # Initialize distributed training
+        if torch.cuda.device_count() > 1:
+            if not dist.is_initialized():
+                torch.cuda.set_device(local_rank)
+                dist.init_process_group(backend='nccl')
+                
         with dask_monitor.monitor_operation("initialization"):
             client = dask_monitor.setup_optimal_cluster(config['dask'])
             data_processor = OceanDataProcessor(
                 ssh_path=config['paths']['ssh_zarr'],
-                sst_path=config['paths']['sst_path'],
-                vnt_path=config['paths']['vnt_path']
+                sst_path=config['paths']['sst_zarr'],
+                vnt_path=config['paths']['vnt_zarr']
             )
-
+            
+        # if args.mode in ['analyze', 'all']:
+        #     analyze_data(config, data_processor)
+            
         if args.mode in ['train', 'all']:
-            train_model(config, data_processor)
-
+            train_model(config, data_processor, local_rank)
+            
     except Exception as e:
         logger.error(f"Error in main execution: {str(e)}")
         logger.error(traceback.format_exc())
@@ -274,6 +278,7 @@ def main():
         if wandb.run:
             wandb.finish()
         dask_monitor.shutdown()
+
 
 if __name__ == "__main__":
     main()

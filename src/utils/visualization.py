@@ -52,13 +52,19 @@ class OceanVisualizer:
             self.logger.info("Falling back to basic matplotlib settings")
 
     def _log_config_to_wandb(self):
-        wandb.config.update({
-            "visualization": {
-                "fig_size": self.fig_size,
-                "dpi": self.dpi,
-                "output_dir": str(self.output_dir)
-            }
-        }, allow_val_change=True)
+        """Log visualization config to wandb if initialized."""
+        try:
+            if wandb.run is not None:
+                wandb.config.update({
+                    "visualization": {
+                        "fig_size": self.fig_size,
+                        "dpi": self.dpi,
+                        "output_dir": str(self.output_dir)
+                    }
+                }, allow_val_change=True)
+        except Exception as e:
+            self.logger.warning(f"Could not log to wandb: {str(e)}")
+            pass
 
     def _setup_ocean_map(self, ax):
         ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
