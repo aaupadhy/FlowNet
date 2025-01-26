@@ -64,6 +64,12 @@ class OceanVisualizer:
         ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
         ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
         ax.add_feature(cfeature.BORDERS, linestyle=':')
+        
+        # Gyre region focus 
+        lon_min, lon_max = -80, 0  # Atlantic focus
+        lat_min, lat_max = 10, 60  # Main gyre region
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
+        
         gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
         gl.top_labels = False
         gl.right_labels = False
@@ -106,14 +112,18 @@ class OceanVisualizer:
         tlat_grid = np.linspace(tlat.min(), tlat.max(), mean_attention.shape[0])
         tlong_grid = np.linspace(tlong.min(), tlong.max(), mean_attention.shape[1])
         
+        # Normalize attention weights to make patterns more visible
+        mean_attention = (mean_attention - mean_attention.min()) / (mean_attention.max() - mean_attention.min() + 1e-6)
+        
         self._setup_ocean_map(ax_heat)
         heat_map = ax_heat.pcolormesh(
             tlong_grid, tlat_grid, mean_attention,
             transform=self.projection,
-            cmap=sns.color_palette("rocket_r", as_cmap=True),
+            cmap='YlOrRd',  # Changed colormap for better visibility
+            norm=colors.LogNorm(vmin=1e-3, vmax=1.0),  # Log scale to highlight variations
             shading='auto'
         )
-        plt.colorbar(heat_map, ax=ax_heat, label='Heat Transport Contribution')
+        plt.colorbar(heat_map, ax=ax_heat, label='Heat Transport Contribution (normalized)')
         ax_heat.set_title('Ocean Heat Transport Pattern')
         
         self._setup_ocean_map(ax_attn)
@@ -200,16 +210,20 @@ class OceanVisualizer:
         
         scatter = ax1.scatter(targets, predictions, alpha=0.5, c='blue')
         ax1.plot([min(targets), max(targets)], [min(targets), max(targets)], 'r--')
-        ax1.set_xlabel('True Heat Transport (PW)')
-        ax1.set_ylabel('Predicted Heat Transport (PW)')
+        ax1.set_xlabel('True Heat Transport (Normalized)')
+        ax1.set_ylabel('Predicted Heat Transport (Normalized)')
         ax1.set_title('Prediction Accuracy')
         
         time_series = ax2.plot(time_indices, targets, 'b-', label='True', alpha=0.7)
         ax2.plot(time_indices, predictions, 'r--', label='Predicted', alpha=0.7)
         ax2.set_xlabel('Time Steps')
-        ax2.set_ylabel('Heat Transport (PW)')
+        ax2.set_ylabel('Heat Transport (Normalized)')
         ax2.set_title('Heat Transport Time Series')
         ax2.legend()
+
+        note_text = ("Note: Values shown are normalized. Raw values in degC*m³/s\n"
+                    "To convert to Watts: multiply by 4184 * 1025")
+        fig.text(0.1, 0.01, note_text, fontsize=8, style='italic')
         
         plt.tight_layout()
         

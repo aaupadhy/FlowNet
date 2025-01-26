@@ -3,6 +3,8 @@ import yaml
 from pathlib import Path
 import logging
 import sys
+import torch.distributed as dist
+import os
 from contextlib import contextmanager
 import time
 from datetime import datetime
@@ -234,6 +236,7 @@ def train_model(config: dict, data_processor: OceanDataProcessor) -> None:
         raise
 
 def main():
+    local_rank = int(os.environ["LOCAL_RANK"])
     parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
     parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
     parser.add_argument('--mode', choices=['analyze', 'train', 'all'], default='train',
@@ -247,13 +250,18 @@ def main():
     try:
         config = load_config(args.config)
         setup_directories(config)
-        run_name = f"FlowNet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        wandb.init(
-            project="FlowNet",
-            name=run_name,
-            config=config,
-            settings=wandb.Settings(start_method="thread")
-        )
+        run_name = f"FlowNet_{datetime.now().strftime('%m%d_%H%M%S')}"
+        if torch.cuda.device_count() > 1 and not dist.is_initialized():
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(backend='nccl')
+            
+        if local_rank == 0:
+            wandb.init(
+                project="FlowNet",
+                name=run_name,
+                config=config,
+                settings=wandb.Settings(start_method="thread")
+            )
         with dask_monitor.monitor_operation("initialization"):
             client = dask_monitor.setup_optimal_cluster(config['dask'])
             logger.info(f"Dask dashboard available at: {client.dashboard_link}")

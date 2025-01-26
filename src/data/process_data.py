@@ -3,6 +3,7 @@ import numpy as np
 import dask
 import dask.array as da
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 import logging
@@ -10,24 +11,36 @@ from pathlib import Path
 import gc
 from tqdm import tqdm
 from ..utils.dask_utils import dask_monitor
+import os
+
+def setup_distributed():
+    if torch.cuda.device_count() > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        return rank, world_size
+    return 0, 1
 
 class OceanDataProcessor:
     def __init__(self, ssh_path: str, sst_path: str, vnt_path: str):
+        self.rank, _ = setup_distributed()
         self.logger = logging.getLogger(__name__)
-        
         self.cache_dir = Path('/scratch/user/aaupadhy/college/RA/final_data/cache')
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.logger.info(f"Created/verified cache directory at {self.cache_dir}")
-        
+        if self.rank == 0:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.logger.info(f"Created/verified cache directory at {self.cache_dir}")
+            
         with dask_monitor.profile_task("data_loading"):
-            self.logger.info("Loading datasets...")
+            if self.rank == 0:
+                self.logger.info("Loading datasets...")
             self._load_datasets(ssh_path, sst_path, vnt_path)
+
 
     def _cleanup_memory(self):
         gc.collect()
-        if hasattr(self, 'client'): 
+        if hasattr(self, 'client'):
             self.client.cancel(self.client.get_current_task())
-            
         torch.cuda.empty_cache()
         self.logger.info(f"Memory cleaned up. Current GPU memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
@@ -35,20 +48,15 @@ class OceanDataProcessor:
         if not hasattr(data_array, 'chunks') or data_array.chunks is None:
             self.logger.info(f"{array_name} is not dask-backed or has no chunks. Shape: {data_array.shape}")
             return {}
-
         chunk_tuples = data_array.chunks
         dtype_size = data_array.dtype.itemsize
-
         total_elems = np.prod(data_array.shape)
         total_mem_gb = (total_elems * dtype_size) / (1024**3)
-        
         chunks_per_dim = [len(dim_c) for dim_c in chunk_tuples]
         n_chunks = np.prod(chunks_per_dim)
-        
         avg_shape_per_dim = [np.mean(dim_chunk_sizes) for dim_chunk_sizes in chunk_tuples]
         avg_chunk_elems = int(np.prod(avg_shape_per_dim))
         avg_chunk_mem_gb = (avg_chunk_elems * dtype_size) / (1024**3)
-        
         stats = {
             "shape": data_array.shape,
             "dtype": str(data_array.dtype),
@@ -57,99 +65,118 @@ class OceanDataProcessor:
             "chunks_per_dim": chunks_per_dim,
             "avg_chunk_size_gb": avg_chunk_mem_gb
         }
-        
         self.logger.info(f"\nChunk stats for {array_name}:")
         for key, value in stats.items():
             self.logger.info(f"  {key}: {value}")
-        
         return stats
-    
-    
+
     def _load_datasets(self, ssh_path, sst_path, vnt_path):
-        """
-        Load and initialize all required datasets with proper chunking and statistics computation.
-        """
         try:
-            # Define base chunking strategy
-            base_chunks = {'time': 180, 'nlat': 'auto', 'nlon': 'auto'}
+            # Only rank 0 loads the datasets initially
+            if self.rank == 0:
+                base_chunks = {'time': 180, 'nlat': 'auto', 'nlon': 'auto'}
+                self.ssh_ds = xr.open_dataset(ssh_path, engine="zarr", chunks=None)
+                self.ssh_ds = self.ssh_ds.chunk(base_chunks)
+                self.sst_ds = xr.open_dataset(sst_path, engine="zarr", chunks=None)
+                self.sst_ds = self.sst_ds.chunk(base_chunks)
+                vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 300, 'z_t': None}
+                self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
+                self.vnt_ds = self.vnt_ds.chunk(vnt_chunks)
+
+                with dask_monitor.profile_task("compute_statistics"):
+                    ssh_sample = self.ssh_ds["SSH"][0].compute()
+                    self.ssh_mean, self.ssh_std = self._compute_mean_std(self.ssh_ds["SSH"], "SSH")
+                    self.sst_mean, self.sst_std = self._compute_mean_std(self.sst_ds["SST"], "SST")
+                    self.shape = self.sst_ds["SST"].shape
+                    self.reference_latitude = self._find_reference_latitude()
             
-            # Load SSH dataset
-            self.logger.info("Loading SSH dataset...")
-            self.ssh_ds = xr.open_dataset(ssh_path, engine="zarr", chunks=None)
-            self.ssh_ds = self.ssh_ds.chunk(base_chunks)
-            
-            # Load SST dataset
-            self.logger.info("Loading SST dataset...")
-            self.sst_ds = xr.open_dataset(sst_path, engine="zarr", chunks=None)
-            self.sst_ds = self.sst_ds.chunk(base_chunks)
-            
-            # Load VNT dataset with different chunking
-            self.logger.info("Loading VNT dataset...")
-            vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 300, 'z_t': None}
-            self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
-            self.vnt_ds = self.vnt_ds.chunk(vnt_chunks)
-            
-            # Find reference latitude for heat transport calculations
-            self.reference_latitude = self._find_reference_latitude()
-            
-            # Compute statistics for normalization
-            with dask_monitor.profile_task("compute_statistics"):
-                # Analyze SSH sample
-                ssh_sample = self.ssh_ds["SSH"][0].compute()  # First timestep only for sample
-                self.logger.info(f"SSH sample stats:")
-                self.logger.info(f"Shape: {ssh_sample.shape}")
-                self.logger.info(f"Any NaNs: {np.any(np.isnan(ssh_sample))}")
-                self.logger.info(f"Min/Max: {float(ssh_sample.min())}/{float(ssh_sample.max())}")
+            # Broadcast key parameters across processes
+            if torch.cuda.device_count() > 1:
+                # Broadcast paths and statistical parameters
+                if self.rank == 0:
+                    ssh_path_tensor = torch.tensor([ord(c) for c in ssh_path], dtype=torch.int32, device='cuda')
+                    sst_path_tensor = torch.tensor([ord(c) for c in sst_path], dtype=torch.int32, device='cuda')
+                    vnt_path_tensor = torch.tensor([ord(c) for c in vnt_path], dtype=torch.int32, device='cuda')
+                    
+                    path_lengths = torch.tensor([len(ssh_path), len(sst_path), len(vnt_path)], dtype=torch.int32, device='cuda')
+                    
+                    stats_tensor = torch.tensor([
+                        self.ssh_mean, 
+                        self.ssh_std, 
+                        self.sst_mean, 
+                        self.sst_std
+                    ], device='cuda')
+                    shape_tensor = torch.tensor(self.shape, device='cuda', dtype=torch.long)
+                    ref_lat_tensor = torch.tensor([self.reference_latitude], device='cuda')
+                else:
+                    ssh_path_tensor = torch.zeros(max(len(ssh_path), 1), dtype=torch.int32, device='cuda')
+                    sst_path_tensor = torch.zeros(max(len(sst_path), 1), dtype=torch.int32, device='cuda')
+                    vnt_path_tensor = torch.zeros(max(len(vnt_path), 1), dtype=torch.int32, device='cuda')
+                    
+                    path_lengths = torch.zeros(3, dtype=torch.int32, device='cuda')
+                    
+                    stats_tensor = torch.zeros(4, device='cuda')
+                    shape_tensor = torch.zeros(3, device='cuda', dtype=torch.long)
+                    ref_lat_tensor = torch.zeros(1, device='cuda')
                 
-                # Compute SSH statistics
-                self.logger.info("Computing SSH statistics...")
-                self.ssh_mean, self.ssh_std = self._compute_mean_std(
-                    self.ssh_ds["SSH"],
-                    var_name="SSH"
-                )
-                self.logger.info(f"Final SSH stats:")
-                self.logger.info(f"Mean: {self.ssh_mean:.6f}")
-                self.logger.info(f"Std: {self.ssh_std:.6f}")
+                # Broadcast tensors
+                dist.broadcast(ssh_path_tensor, 0)
+                dist.broadcast(sst_path_tensor, 0)
+                dist.broadcast(vnt_path_tensor, 0)
+                dist.broadcast(path_lengths, 0)
+                dist.broadcast(stats_tensor, 0)
+                dist.broadcast(shape_tensor, 0)
+                dist.broadcast(ref_lat_tensor, 0)
                 
-                # Compute SST statistics
-                self.logger.info("Computing SST statistics...")
-                self.sst_mean, self.sst_std = self._compute_mean_std(
-                    self.sst_ds["SST"],
-                    var_name="SST"
-                )
-                self.logger.info(f"Final SST stats:")
-                self.logger.info(f"Mean: {self.sst_mean:.6f}")
-                self.logger.info(f"Std: {self.sst_std:.6f}")
+                # Reconstruct paths for non-rank-0 processes
+                if self.rank != 0:
+                    ssh_path = ''.join(chr(x) for x in ssh_path_tensor[:path_lengths[0]])
+                    sst_path = ''.join(chr(x) for x in sst_path_tensor[:path_lengths[1]])
+                    vnt_path = ''.join(chr(x) for x in vnt_path_tensor[:path_lengths[2]])
+                    
+                    # Reload datasets for non-rank-0 processes
+                    base_chunks = {'time': 180, 'nlat': 'auto', 'nlon': 'auto'}
+                    self.ssh_ds = xr.open_dataset(ssh_path, engine="zarr", chunks=None)
+                    self.ssh_ds = self.ssh_ds.chunk(base_chunks)
+                    self.sst_ds = xr.open_dataset(sst_path, engine="zarr", chunks=None)
+                    self.sst_ds = self.sst_ds.chunk(base_chunks)
+                    vnt_chunks = {'time': 12, 'nlat': 300, 'nlon': 300, 'z_t': None}
+                    self.vnt_ds = xr.open_dataset(vnt_path, engine="zarr", chunks=None)
+                    self.vnt_ds = self.vnt_ds.chunk(vnt_chunks)
+                    
+                    # Unpack broadcasted values
+                    (self.ssh_mean, 
+                    self.ssh_std, 
+                    self.sst_mean, 
+                    self.sst_std) = stats_tensor.tolist()
+                    
+                    self.shape = tuple(shape_tensor.tolist())
+                    self.reference_latitude = int(ref_lat_tensor.item())
             
-            # Store dataset properties
-            self.tarea_conversion = 0.0001  # Area conversion factor
-            self.dz_conversion = 0.01       # Depth conversion factor
-            self.shape = self.sst_ds["SST"].shape
+            self.tarea_conversion = 0.0001
+            self.dz_conversion = 0.01
             
-            # Store essential statistics
-            self.stats = {
-                'grid_shape': self.shape,
-                'ssh_mean': self.ssh_mean,
-                'ssh_std': self.ssh_std,
-                'sst_mean': self.sst_mean,
-                'sst_std': self.sst_std,
-                'spatial_dims': {
-                    'nlat': self.shape[1],
-                    'nlon': self.shape[2]
-                },
-                'time_steps': self.shape[0]
-            }
-            
-            # Validate statistics
-            self._validate_statistics()
-            
-            self.logger.info("Successfully loaded all datasets")
-            
+            # Create stats dictionary for rank 0
+            if self.rank == 0:
+                self.stats = {
+                    'grid_shape': self.shape,
+                    'ssh_mean': self.ssh_mean,
+                    'ssh_std': self.ssh_std,
+                    'sst_mean': self.sst_mean,
+                    'sst_std': self.sst_std,
+                    'spatial_dims': {'nlat': self.shape[1], 'nlon': self.shape[2]},
+                    'time_steps': self.shape[0]
+                }
+                self._validate_statistics()
+                self.logger.info("Successfully loaded all datasets")
+
         except Exception as e:
-            self.logger.error(f"Error loading datasets: {str(e)}")
+            if self.rank == 0:
+                self.logger.error(f"Error loading datasets: {str(e)}")
             self._cleanup_memory()
             raise
-
+    
+    
     def _validate_data_consistency(self):
         """Validate consistency between datasets."""
         # Check temporal alignment
@@ -210,7 +237,6 @@ class OceanDataProcessor:
         """
         cache_file = Path('/scratch/user/aaupadhy/college/RA/final_data/cache/ref_lat_index.npy')
         
-        # Try to load from cache first
         if cache_file.exists():
             try:
                 ref_lat_idx = int(np.load(cache_file))
@@ -228,10 +254,8 @@ class OceanDataProcessor:
                 self.logger.warning(f"Failed to load cached reference latitude: {str(e)}. Recomputing...")
         
         try:
-            # Get raw TLAT values
             tlat = self.vnt_ds['TLAT']
             
-            # Log the full latitude range
             lat_min = float(tlat.min().compute())
             lat_max = float(tlat.max().compute())
             self.logger.info(f"Full latitude range: {lat_min:.2f}°N to {lat_max:.2f}°N")
@@ -239,21 +263,17 @@ class OceanDataProcessor:
             if not (lat_min <= 40 <= lat_max):
                 raise ValueError(f"40°N outside available range [{lat_min:.2f}°N, {lat_max:.2f}°N]")
             
-            # Convert to numpy array for processing
             lat_array = tlat.compute()
             
-            # Find all points close to 40°N
             target_mask = (lat_array >= 39.9) & (lat_array <= 40.1)
             valid_rows, valid_cols = np.where(target_mask)
             
             if len(valid_rows) == 0:
-                # If no exact matches, try finding closest points
                 distances = np.abs(lat_array - 40.0)
                 min_distance = float(distances.min())
                 self.logger.info(f"No points in target range. Closest point is {min_distance:.4f}° away from 40°N")
                 raise ValueError("No points found between 39.9°N and 40.1°N")
                 
-            # Group points by row and analyze each row
             row_stats = {}
             for row, col in zip(valid_rows, valid_cols):
                 if row not in row_stats:
@@ -264,7 +284,6 @@ class OceanDataProcessor:
                 row_stats[row]['points'].append(col)
                 row_stats[row]['lats'].append(lat_array[row, col])
             
-            # Calculate statistics for each row
             analyzed_rows = []
             for row, stats in row_stats.items():
                 lats = np.array(stats['lats'])
@@ -278,7 +297,6 @@ class OceanDataProcessor:
                     'columns': stats['points']
                 })
             
-            # Log detailed information about found points
             self.logger.info(f"\nFound points near 40°N in {len(analyzed_rows)} rows:")
             for row_data in analyzed_rows:
                 self.logger.info(
@@ -287,18 +305,15 @@ class OceanDataProcessor:
                     f"range=[{row_data['min_lat']:.4f}°N, {row_data['max_lat']:.4f}°N]"
                 )
             
-            # Select best row based on number of points and mean latitude
             best_row = max(analyzed_rows, key=lambda x: x['num_points'])
             ref_lat_idx = best_row['row']
             
-            # Verify selected row is suitable
             if best_row['num_points'] < 10:
                 raise ValueError(f"Best row only has {best_row['num_points']} points near 40°N")
             
             if abs(best_row['mean_lat'] - 40.0) > 0.2:
                 raise ValueError(f"Best row mean latitude {best_row['mean_lat']:.4f}°N too far from 40°N")
             
-            # Log final selection details
             self.logger.info(f"\nSelected row {ref_lat_idx}:")
             self.logger.info(f"  Number of points: {best_row['num_points']}")
             self.logger.info(f"  Mean latitude: {best_row['mean_lat']:.4f}°N")
@@ -306,7 +321,6 @@ class OceanDataProcessor:
             self.logger.info(f"  Latitude range: [{best_row['min_lat']:.4f}°N, {best_row['max_lat']:.4f}°N]")
             self.logger.info(f"  Columns: {best_row['columns'][:5]}... (showing first 5)")
             
-            # Cache the validated result
             np.save(cache_file, ref_lat_idx)
             
             return ref_lat_idx
@@ -471,27 +485,11 @@ class OceanDataProcessor:
             self._cleanup_memory()
 
 class OceanDataset(Dataset):
-    """Dataset class for ocean data with standardization."""
-    
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean,
                  ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False):
-        """
-        Initialize dataset with raw data and statistics for normalization.
-        
-        Args:
-            ssh: SSH data array
-            sst: SST data array
-            heat_transport: Heat transport data array
-            heat_transport_mean: Mean value for heat transport
-            ssh_mean: Global mean for SSH (scalar)
-            ssh_std: Global std for SSH (scalar)
-            sst_mean: Global mean for SST (scalar)
-            sst_std: Global std for SST (scalar)
-            shape: Shape of the data arrays
-        """
-
+        self.rank, _ = setup_distributed()
         self.logger = logging.getLogger(__name__)
-       
+        
         if debug:
             self.ssh = ssh.isel(time=slice(0, 32))
             self.sst = sst.isel(time=slice(0, 32))
@@ -501,32 +499,52 @@ class OceanDataset(Dataset):
             self.ssh = ssh
             self.sst = sst
             self.length = shape[0]
-            
 
-        # Standardize heat transport
-        heat_transport_std = np.std(heat_transport)
-        self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
+        if self.rank == 0:
+            heat_transport_std = np.std(heat_transport)
+            self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
+            if torch.cuda.device_count() > 1:
+                heat_transport_tensor = torch.from_numpy(self.heat_transport).cuda()
         
-        self.logger.info(f"Heat Transport statistics after standardization:")
-        self.logger.info(f"  Min: {np.min(self.heat_transport):.2f}")
-        self.logger.info(f"  Max: {np.max(self.heat_transport):.2f}")
-        self.logger.info(f"  Mean: {np.mean(self.heat_transport):.2f}")
-        self.logger.info(f"  Std: {np.std(self.heat_transport):.2f}")
+        if torch.cuda.device_count() > 1:
+            if self.rank == 0:
+                heat_transport_tensor = torch.from_numpy(self.heat_transport).cuda()
+            else:
+                heat_transport_tensor = torch.zeros(len(heat_transport), device='cuda')
+            dist.broadcast(heat_transport_tensor, 0)
+            self.heat_transport = heat_transport_tensor.cpu().numpy()
+
+        if self.rank == 0:
+            self.logger.info(f"Heat Transport statistics after standardization:")
+            self.logger.info(f"  Min: {np.min(self.heat_transport):.2f}")
+            self.logger.info(f"  Max: {np.max(self.heat_transport):.2f}")
+            self.logger.info(f"  Mean: {np.mean(self.heat_transport):.2f}")
+            self.logger.info(f"  Std: {np.std(self.heat_transport):.2f}")
+
+        self.ssh_mean = float(ssh_mean)
+        self.ssh_std = float(ssh_std)
+        self.sst_mean = float(sst_mean)
+        self.sst_std = float(sst_std)
         
-        self.ssh_mean = float(ssh_mean) 
-        self.ssh_std = float(ssh_std)   
-        self.sst_mean = float(sst_mean) 
-        self.sst_std = float(sst_std)    
-        
-        self.logger.info(f"Normalization parameters:")
-        self.logger.info(f"  SSH mean: {self.ssh_mean:.4f}")
-        self.logger.info(f"  SSH std:  {self.ssh_std:.4f}")
-        self.logger.info(f"  SST mean: {self.sst_mean:.4f}")
-        self.logger.info(f"  SST std:  {self.sst_std:.4f}")
-        
+        if self.rank == 0:
+            self.logger.info(f"Normalization parameters:")
+            self.logger.info(f"  SSH mean: {self.ssh_mean:.4f}")
+            self.logger.info(f"  SSH std:  {self.ssh_std:.4f}")
+            self.logger.info(f"  SST mean: {self.sst_mean:.4f}")
+            self.logger.info(f"  SST std:  {self.sst_std:.4f}")
+
         self.MISSING_VALUE = 9.96921e+36
-        self.ssh_bounds, self.sst_bounds = self.analyze_distributions(ssh, sst)
+        if self.rank == 0:
+            self.ssh_bounds, self.sst_bounds = self.analyze_distributions(ssh, sst)
+            bounds = torch.tensor([*self.ssh_bounds, *self.sst_bounds], device='cuda')
+        else:
+            bounds = torch.zeros(4, device='cuda')
         
+        if torch.cuda.device_count() > 1:
+            dist.broadcast(bounds, 0)
+            self.ssh_bounds = (bounds[0].item(), bounds[1].item())
+            self.sst_bounds = (bounds[2].item(), bounds[3].item())
+
         ssh_vals = ssh.isel(time=0).values
         sst_vals = sst.isel(time=0).values
         ssh_valid = ssh_vals != self.MISSING_VALUE

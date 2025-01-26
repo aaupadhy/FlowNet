@@ -108,7 +108,6 @@ class OceanDataMonitor:
         plt.colorbar(im, label='Data Availability')
         plt.title(f'Spatial Coverage - {var_name}')
         
-        # Save plot
         save_path = self.plots_dir / f'spatial_coverage_{var_name}.png'
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -190,5 +189,4 @@ class OceanDataMonitor:
         
         self.logger.info(f"Monitoring report saved to {report_path}")
 
-# Create global instance
 ocean_monitor = OceanDataMonitor()

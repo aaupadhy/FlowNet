@@ -15,7 +15,7 @@ class ChunkProfiler:
         self.logger = logger
         self.metrics = []
         self.output_dir = Path('chunk_profiles')
-        self.output_dir.mkdir(exist_ok=True)
+        # self.output_dir.mkdir(exist_ok=True)
     
     def profile_chunks(self, dask_array, operation='compute'):
         """Profile performance of current chunking"""
@@ -165,9 +165,9 @@ class DaskManager:
             })
             
             self.cluster = LocalCluster(
-                n_workers=n_workers,
-                threads_per_worker=4,
-                memory_limit="30GB",
+                n_workers=2,
+                threads_per_worker=2,
+                memory_limit="60GB",
                 silence_logs=logging.WARNING,
                 dashboard_address=':8787',
             )

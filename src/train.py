@@ -1,10 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+
 from torch.utils.data import DataLoader, TensorDataset, Dataset, random_split
 from src.data.process_data import OceanDataProcessor, OceanDataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group
+from torch.utils.data.distributed import DistributedSampler
 import logging
 import traceback
+import os
 from pathlib import Path
 import wandb
 import numpy as np
@@ -16,6 +22,15 @@ from src.utils.training_monitor import TrainingMonitor
 import torch.cuda.amp
 from torch.cuda.amp import autocast
 
+def setup_distributed():
+    if torch.cuda.device_count() > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        return rank, world_size
+    return 0, 1
+
 class OceanTrainer:
     def __init__(
         self,
@@ -24,16 +39,25 @@ class OceanTrainer:
         save_dir: Path,
         device: str = 'cuda'
     ):
-        self.model = model.to(device)
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.device = torch.device(f'cuda:{self.local_rank}')
+        if not dist.is_initialized() and torch.cuda.device_count() > 1:
+            dist.init_process_group(backend='nccl')
+        
+        if torch.cuda.device_count() > 1:
+            self.model = DDP(model.to(self.device), device_ids=[self.local_rank])
+        else:
+            self.model = model.to(self.device)
         self.config = config
         self.save_dir = Path(save_dir)
-        self.device = device
+        self.rank, self.world_size = setup_distributed()
         self.logger = logging.getLogger(__name__)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self._init_wandb()
-        self.monitor = TrainingMonitor(config, save_dir)
-        self.monitor.log_model_summary(model)
-        self.criterion = nn.SmoothL1Loss()
+        if self.local_rank == 0:
+            self._init_wandb()
+            self.monitor = TrainingMonitor(config, save_dir)
+            self.monitor.log_model_summary(model)
+        self.criterion = nn.SmoothL1Loss(reduction='mean')
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config['training']['learning_rate'],
@@ -71,6 +95,7 @@ class OceanTrainer:
 
     def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, 
                           ssh_mean, ssh_std, sst_mean, sst_std, shape):
+        
         debug_mode = self.config['training'].get('debug_mode', False)
         debug_samples = self.config['training'].get('debug_samples', 32)
         
@@ -93,11 +118,13 @@ class OceanTrainer:
         train_dataset, val_dataset, test_dataset = random_split(
             dataset, [train_size, val_size, test_size]
         )
-        
+        train_sampler = DistributedSampler(train_dataset) if torch.cuda.device_count() > 1 else None
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config['training']['batch_size'],
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             pin_memory=True,
             num_workers=0
         )
@@ -223,6 +250,8 @@ class OceanTrainer:
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader, start_epoch: int = 0):
         try:
+            # if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+            #     train_loader.sampler.set_epoch(epoch)
             if self.scheduler is None:
                 self.setup_scheduler(train_loader)
                 
@@ -409,7 +438,8 @@ class OceanTrainer:
                     self.logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                     break
                     
-            self.save_checkpoint(epoch, metrics)
+            if self.local_rank == 0:
+                self.save_checkpoint(epoch, metrics, is_best=True)
             self.monitor.finish()
             wandb.finish()
             
@@ -466,12 +496,12 @@ class OceanTrainer:
                 
             predictions.extend((output.cpu() + heat_transport_mean).numpy())
             targets.extend((target.cpu() + heat_transport_mean).numpy())
-            attention_maps.extend(attn_map.cpu().numpy())
+            attention_maps.append(attn_map.detach().cpu().numpy())
             test_losses.append(loss.item())
             
         predictions = np.array(predictions)
         targets = np.array(targets)
-        attention_maps = np.array(attention_maps)
+        attention_maps = np.concatenate(attention_maps, axis=0)
         
         metrics = {
             'test_loss': np.mean(test_losses),
