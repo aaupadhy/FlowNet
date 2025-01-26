@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=ocean_train
+#SBATCH --output=%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --mem=140G
 #SBATCH --time=48:00:00
 

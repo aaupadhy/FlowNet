@@ -243,51 +243,36 @@ def main():
                       help='Mode of operation')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
-    
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
+
     try:
         config = load_config(args.config)
         setup_directories(config)
-        run_name = f"FlowNet_{datetime.now().strftime('%m%d_%H%M%S')}"
+
         if torch.cuda.device_count() > 1 and not dist.is_initialized():
             torch.cuda.set_device(local_rank)
             dist.init_process_group(backend='nccl')
-            
-        if local_rank == 0:
-            wandb.init(
-                project="FlowNet",
-                name=run_name,
-                config=config,
-                settings=wandb.Settings(start_method="thread")
-            )
+
         with dask_monitor.monitor_operation("initialization"):
             client = dask_monitor.setup_optimal_cluster(config['dask'])
-            logger.info(f"Dask dashboard available at: {client.dashboard_link}")
-            
             data_processor = OceanDataProcessor(
                 ssh_path=config['paths']['ssh_zarr'],
-                sst_path=config['paths']['sst_zarr'],
-                vnt_path=config['paths']['vnt_zarr']
+                sst_path=config['paths']['sst_path'],
+                vnt_path=config['paths']['vnt_path']
             )
-        
+
         if args.mode in ['train', 'all']:
             train_model(config, data_processor)
-        
-        ocean_monitor.save_metrics()
-        ocean_monitor.create_monitoring_report()
-        dask_monitor.save_monitoring_data(config['paths']['output_dir'])
-        
-        logger.info("All operations completed successfully!")
-        
+
     except Exception as e:
         logger.error(f"Error in main execution: {str(e)}")
         logger.error(traceback.format_exc())
+        if wandb.run:
+            wandb.finish()
         sys.exit(1)
-        
     finally:
         logger.info("Cleaning up resources...")
+        if wandb.run:
+            wandb.finish()
         dask_monitor.shutdown()
 
 if __name__ == "__main__":
