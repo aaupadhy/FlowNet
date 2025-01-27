@@ -3,7 +3,6 @@ import yaml
 from pathlib import Path
 import logging
 import sys
-import torch.distributed as dist
 import os
 from contextlib import contextmanager
 import time
@@ -11,16 +10,15 @@ from datetime import datetime
 import torch
 import traceback
 import wandb
-from datetime import timedelta
+import numpy as np
 from src.models.transformer import OceanTransformer
-from src.data.process_data import OceanDataProcessor, OceanDataset
+from src.data.process_data import OceanDataProcessor
 from src.utils.visualization import OceanVisualizer
 from src.utils.dask_utils import dask_monitor
 import torch._dynamo
 torch._dynamo.config.disable = True
 from src.train import OceanTrainer
 from src.utils.ocean_monitor import ocean_monitor
-from src.utils.training_monitor import TrainingMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,17 +28,15 @@ logging.basicConfig(
         logging.FileHandler('ocean_analysis.log')
     ]
 )
-
 logger = logging.getLogger(__name__)
 
-def setup_random_seeds(rank):
+def setup_random_seeds():
     seed = 42
-    torch.manual_seed(seed + rank)
-    torch.cuda.manual_seed(seed + rank)
-    np.random.seed(seed + rank)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
 
 def setup_directories(config):
-    """Ensure all required directories exist"""
     dirs = [
         config['paths']['output_dir'],
         config['paths']['model_dir'],
@@ -48,7 +44,6 @@ def setup_directories(config):
         Path(config['paths']['output_dir']) / 'plots',
         Path(config['paths']['output_dir']) / 'attention_maps'
     ]
-    
     for dir_path in dirs:
         Path(dir_path).mkdir(parents=True, exist_ok=True)
         logger.info(f"Ensured directory exists: {dir_path}")
@@ -63,30 +58,33 @@ def timing_block(name):
         logger.info(f"{name} completed in {duration:.2f} seconds")
 
 def load_config(config_path: str) -> dict:
-    """Load and validate configuration"""
     logger.info(f"Loading configuration from {config_path}")
-    
     try:
         with open(config_path) as f:
             config = yaml.safe_load(f)
-        
         required_keys = ['paths', 'dask', 'data', 'monitoring']
         for key in required_keys:
             if key not in config:
                 raise ValueError(f"Missing required configuration section: {key}")
-        
         for path_key in ['output_dir', 'model_dir']:
             Path(config['paths'][path_key]).mkdir(parents=True, exist_ok=True)
-        
         logger.info("Configuration loaded successfully")
         return config
-        
     except Exception as e:
         logger.error(f"Error loading configuration: {str(e)}")
         raise
 
 def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
     logger.info("Starting data analysis phase")
+    
+    if not wandb.run:
+        wandb.init(
+            project="FlowNet",
+            name=f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            config=config,
+            settings=wandb.Settings(start_method="thread")
+        )
+    
     try:
         with timing_block("Data Analysis"):
             with dask_monitor.monitor_operation("spatial_data_loading"):
@@ -96,19 +94,16 @@ def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
                     fig_size=tuple(config['visualization']['fig_size']),
                     dpi=config['visualization']['dpi']
                 )
-                
                 logger.info("Analyzing spatial coverage...")
                 ocean_monitor.analyze_spatial_coverage(ssh, "SSH")
                 ocean_monitor.analyze_spatial_coverage(sst, "SST")
-                
                 logger.info("Analyzing temporal patterns...")
                 ocean_monitor.analyze_temporal_patterns(ssh, "SSH")
                 ocean_monitor.analyze_temporal_patterns(sst, "SST")
-                
                 logger.info("Validating data...")
                 ocean_monitor.validate_data(ssh, "SSH")
                 ocean_monitor.validate_data(sst, "SST")
-            
+
             logger.info("Saving initial visualizations...")
             visualizer.plot_spatial_pattern(
                 ssh.isel(time=0).compute(),
@@ -117,7 +112,6 @@ def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
                 "SSH Pattern",
                 save_path='initial_ssh_pattern'
             )
-            
             visualizer.plot_spatial_pattern(
                 sst.isel(time=0).compute(),
                 tlat,
@@ -125,24 +119,26 @@ def analyze_data(config: dict, data_processor: OceanDataProcessor) -> None:
                 "SST Pattern",
                 save_path='initial_sst_pattern'
             )
-            
+
             logger.info("Creating performance dashboard...")
             ocean_monitor.create_performance_dashboard()
             ocean_monitor.save_metrics()
-            
             logger.info("Analysis phase completed successfully")
-            return ssh, sst
             
+            if wandb.run and not config.get('continue_to_training', False):
+                wandb.finish()
+                
+            return ssh, sst
+
     except Exception as e:
         logger.error(f"Error during analysis: {str(e)}")
         logger.error(traceback.format_exc())
+        if wandb.run:
+            wandb.finish()
         raise
 
-def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: int):
-    """Train the model with distributed support."""
-    torch.cuda.set_device(local_rank)
+def train_model(config: dict, data_processor: OceanDataProcessor):
     torch.backends.cudnn.benchmark = True
-    
     try:
         with dask_monitor.monitor_operation("training_data_preparation"):
             ssh, sst, tlat, tlong = data_processor.get_spatial_data()
@@ -173,7 +169,6 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
             device='cuda'
         )
 
-        # Create dataloaders
         train_loader, val_loader, test_loader = trainer.create_dataloaders(
             ssh,
             sst,
@@ -193,16 +188,15 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
             logger.info(f"Resumed from epoch {start_epoch} with metrics: {metrics}")
 
         trainer.train(train_loader, val_loader, start_epoch=start_epoch)
-
+        
         logger.info("Generating predictions and attention visualizations")
         test_metrics, predictions, attention_maps = trainer.evaluate(
             test_loader,
             heat_transport_mean
         )
 
-        # Create visualizations
         visualizer = OceanVisualizer(output_dir=config['paths']['output_dir'])
-        attention_maps = attention_maps.mean(dim=1)
+        attention_maps = attention_maps.mean(axis=1)
         attention_maps = attention_maps.reshape((-1, len(ssh.nlat), len(ssh.nlon)))
         
         visualizer.plot_attention_maps(
@@ -220,13 +214,11 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
         )
 
         logger.info(f"Test metrics: {test_metrics}")
-        
         results = {
             'test_metrics': test_metrics,
             'predictions': predictions.tolist(),
             'attention_maps': attention_maps.cpu().numpy().tolist()
         }
-        
         results_path = Path(config['paths']['output_dir']) / 'results.json'
         with open(results_path, 'w') as f:
             json.dump(results, f)
@@ -236,68 +228,26 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
         logger.error(traceback.format_exc())
         raise
 
-def init_distributed():
-    """Initialize distributed training."""
-    if torch.cuda.device_count() > 1:
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        
-        # Initialize process group with timeout
-        os.environ["NCCL_DEBUG"] = "INFO"
-        os.environ["NCCL_IB_TIMEOUT"] = "45" 
-        os.environ["NCCL_SOCKET_TIMEOUT"] = "45"
-        
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            timeout=timedelta(minutes=5)  # Fixed timedelta reference
-        )
-        return local_rank, dist.get_world_size()
-    return 0, 1
-
 def main():
     parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
     parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
     parser.add_argument('--mode', choices=['analyze', 'train', 'all'], default='train',
                       help='Mode of operation')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     args = parser.parse_args()
-    
-    local_rank = 0
-    world_size = 1
+
     client = None
-    
     try:
-        local_rank, world_size = init_distributed()
-        
         config = load_config(args.config)
-        
-        if local_rank == 0:
-            setup_directories(config)
-        
-        if world_size > 1:
-            try:
-                dist.barrier()
-            except Exception as e:
-                logger.error(f"Failed at directory setup barrier: {str(e)}")
-                raise
-        
-        if local_rank == 0:
-            try:
-                with dask_monitor.monitor_operation("initialization"):
-                    client = dask_monitor.setup_optimal_cluster(config['dask'])
-            except Exception as e:
-                logger.error(f"Failed to initialize dask: {str(e)}")
-                raise
-        
-        if world_size > 1:
-            try:
-                dist.barrier()
-            except Exception as e:
-                logger.error(f"Failed at dask init barrier: {str(e)}")
-                raise
-        
+        setup_directories(config)
+
+        try:
+            with dask_monitor.monitor_operation("initialization"):
+                client = dask_monitor.setup_optimal_cluster(config['dask'])
+        except Exception as e:
+            logger.error(f"Failed to initialize dask: {str(e)}")
+            raise
+
         try:
             data_processor = OceanDataProcessor(
                 ssh_path=config['paths']['ssh_zarr'],
@@ -307,29 +257,25 @@ def main():
         except Exception as e:
             logger.error(f"Failed to create data processor: {str(e)}")
             raise
-        
+
+        if args.mode in ['analyze', 'all']:
+            ssh, sst = analyze_data(config, data_processor)
+
         if args.mode in ['train', 'all']:
-            train_model(config, data_processor, local_rank)
-            
+            train_model(config, data_processor)
+
     except Exception as e:
         logger.error(f"Error in main execution: {str(e)}")
         logger.error(traceback.format_exc())
         if wandb.run:
             wandb.finish()
-        if world_size > 1 and dist.is_initialized():
-            dist.destroy_process_group()
         sys.exit(1)
-        
     finally:
         logger.info("Cleaning up resources...")
         if wandb.run:
             wandb.finish()
-        if local_rank == 0 and client is not None:
+        if client is not None:
             dask_monitor.shutdown()
-        # Ensure clean process group shutdown
-        if world_size > 1 and dist.is_initialized():
-            dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()

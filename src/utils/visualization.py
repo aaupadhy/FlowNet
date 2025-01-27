@@ -14,7 +14,7 @@ import matplotlib.colors as colors
 import wandb
 
 class OceanVisualizer:
-    def __init__(self, output_dir: str, fig_size: tuple = (12, 8), dpi: int = 300):
+    def __init__(self, output_dir: Union[str, Path], fig_size: tuple = (20, 8), dpi: int = 300):
         self.output_dir = Path(output_dir)
         self.fig_size = fig_size
         self.dpi = dpi
@@ -23,9 +23,6 @@ class OceanVisualizer:
         
         for dir_name in ['plots', 'attention_maps', 'predictions']:
             (self.output_dir / dir_name).mkdir(parents=True, exist_ok=True)
-            
-        self._setup_plotting_style()
-        self._log_config_to_wandb()
 
     def _setup_plotting_style(self):
         try:
@@ -82,101 +79,78 @@ class OceanVisualizer:
         return gl
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
-        self.logger.info(f"Plotting attention maps with shape: {attention_maps.shape}")
+        self.logger.info(f"Plotting attention maps")
+        fig = plt.figure(figsize=self.fig_size)
+        gs = plt.GridSpec(1, 2, width_ratios=[1, 1])
+        ax1 = fig.add_subplot(gs[0], projection=self.projection)
+        ax2 = fig.add_subplot(gs[1], projection=self.projection)
+
+        lon_min, lon_max = -80, 0
+        lat_min, lat_max = 0, 65
+
+        # Plot 1: Heat Transport
+        ax1.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
+        ax1.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
+        ax1.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        gl1 = ax1.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+        gl1.top_labels = False
+        gl1.right_labels = False
         
-        if not isinstance(attention_maps, np.ndarray):
-            attention_maps = np.array(attention_maps)
-            
-        if len(attention_maps.shape) < 3:
-            raise ValueError(f"Expected attention maps with shape (n_layers, n_heads, ...); got {attention_maps.shape}")
-            
-        if np.isnan(attention_maps).any():
-            self.logger.warning("Found NaN values in attention maps - replacing with zeros")
-            attention_maps = np.nan_to_num(attention_maps, 0.0)
-        
-        n_layers = len(attention_maps)
-        n_heads = attention_maps[0].shape[1]
-        
-        fig = plt.figure(figsize=(20, 10))
-        gs = plt.GridSpec(2, 2, figure=fig, width_ratios=[1, 1])
-        
-        ax_heat = fig.add_subplot(gs[:, 0], projection=self.projection)
-        ax_attn = fig.add_subplot(gs[:, 1], projection=self.projection)
-        
-        mean_attention = np.mean(attention_maps, axis=(0,1))
-        
-        if len(mean_attention.shape) > 2:
-            mean_attention = mean_attention[0]
-            
-        if len(mean_attention.shape) != 2:
-            grid_h = int(np.floor(np.sqrt(mean_attention.shape[0])))
-            grid_w = int(np.ceil(mean_attention.shape[0] / grid_h))
-            mean_attention = mean_attention[:grid_h * grid_w].reshape(grid_h, grid_w)
-            
-        self.logger.info(f"Reshaped attention map to size: {mean_attention.shape}")
-        
-        tlat_grid = np.linspace(tlat.min(), tlat.max(), mean_attention.shape[0])
-        tlong_grid = np.linspace(tlong.min(), tlong.max(), mean_attention.shape[1])
-        
-        # Normalize attention weights to make patterns more visible
-        mean_attention = (mean_attention - mean_attention.min()) / (mean_attention.max() - mean_attention.min() + 1e-6)
-        
-        self._setup_ocean_map(ax_heat)
-        heat_map = ax_heat.pcolormesh(
-            tlong_grid, tlat_grid, mean_attention,
+        mesh1 = ax1.pcolormesh(
+            tlong, tlat, attention_maps,
             transform=self.projection,
-            cmap='YlOrRd',  # Changed colormap for better visibility
-            norm=colors.LogNorm(vmin=1e-3, vmax=1.0),  # Log scale to highlight variations
+            cmap='RdBu_r',
             shading='auto'
         )
-        plt.colorbar(heat_map, ax=ax_heat, label='Heat Transport Contribution (normalized)')
-        ax_heat.set_title('Ocean Heat Transport Pattern')
+        plt.colorbar(mesh1, ax=ax1, orientation='horizontal', pad=0.05, 
+                    label='Meridional Heat Transport')
+        ax1.set_title('Ocean Heat Transport Pattern')
+
+        # Plot 2: Attention Distribution
+        attention_norm = attention_maps / np.max(attention_maps)
+        ax2.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
+        ax2.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
+        ax2.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        gl2 = ax2.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+        gl2.top_labels = False
+        gl2.right_labels = False
         
-        self._setup_ocean_map(ax_attn)
-        attention_map = ax_attn.pcolormesh(
-            tlong_grid, tlat_grid, mean_attention,
+        mesh2 = ax2.pcolormesh(
+            tlong, tlat, attention_norm,
             transform=self.projection,
             cmap='viridis',
             shading='auto'
         )
-        plt.colorbar(attention_map, ax=ax_attn, label='Attention Weight')
-        ax_attn.set_title('Spatial Attention Distribution')
-        
+        plt.colorbar(mesh2, ax=ax2, orientation='horizontal', pad=0.05, 
+                    label='Normalized Attention')
+        ax2.set_title('Spatial Attention Distribution')
+
         plt.tight_layout()
-        
+
         if save_path:
-            if isinstance(save_path, Path):
-                save_path = str(save_path)
-            save_path = Path(save_path)
-            if not save_path.is_absolute():
-                save_path = self.output_dir / 'attention_maps' / f"{save_path.stem}.png"
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            self.logger.info(f"Saving attention map to: {save_path}")
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             plt.close()
-            
-            wandb.log({
-                f"attention_maps/{Path(save_path).stem}": wandb.Image(str(save_path))
-            })
-            
-            self.logger.info(f"Saved attention map visualization to {save_path}")
+            self.logger.info(f"Saved attention map to: {save_path}")
             return None
-            
         return fig
 
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
         self.logger.info(f"Plotting spatial pattern for {title}")
-        
         fig = plt.figure(figsize=self.fig_size)
         ax = plt.axes(projection=self.projection)
-        
         self._setup_ocean_map(ax)
+        
+        # Properly mask the data
+        data_masked = np.ma.masked_invalid(data)
+        
+        # Calculate robust percentiles for colorbar range
+        valid_data = data_masked.compressed()  # Get non-masked values
+        vmin, vmax = np.nanpercentile(valid_data, [2, 98])
+        self.logger.info(f"Data range - Min: {np.nanmin(valid_data):.4f}, Max: {np.nanmax(valid_data):.4f}")
+        self.logger.info(f"Using colorbar range: [{vmin:.4f}, {vmax:.4f}]")
         
         if isinstance(cmap, str) and cmap.startswith('cmo.'):
             cmap = getattr(cmocean.cm, cmap[4:])
-            
-        data_masked = np.ma.masked_invalid(data)
-        vmin, vmax = np.nanpercentile(data_masked, [2, 98])
         
         mesh = ax.pcolormesh(
             tlong, tlat, data_masked,
@@ -187,24 +161,45 @@ class OceanVisualizer:
             shading='auto'
         )
         
-        cbar = plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05)
+        cbar = plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05, extend='both')
         cbar.set_label(title)
         
-        ax.set_title(title)
-        
+        units = ""
+        if "SSH" in title:
+            units = "(meters)"
+        elif "SST" in title:
+            units = "(°C)"
+        if units:
+            ax.set_title(f"{title} {units}")
+        else:
+            ax.set_title(title)
+
         if save_path:
             save_path = self.output_dir / 'plots' / f"{save_path}.png"
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             plt.close()
-            
             wandb.log({
                 f"spatial_patterns/{Path(save_path).stem}": wandb.Image(str(save_path))
             })
-            
             self.logger.info(f"Saved spatial pattern plot to {save_path}")
             return None
-            
         return fig
+
+    def _setup_ocean_map(self, ax):
+        """Helper function to set up a clean ocean map."""
+        ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+        ax.add_feature(cfeature.BORDERS, linestyle=':')
+        
+        lon_min, lon_max = -80, 0
+        lat_min, lat_max = 10, 60
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
+        
+        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+        gl.top_labels = False
+        gl.right_labels = False
+        
+        return gl
 
     def plot_predictions(self, predictions, targets, time_indices=None, save_path=None):
         self.logger.info("Plotting model predictions vs targets")

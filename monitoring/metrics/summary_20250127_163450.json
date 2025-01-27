@@ -1,0 +1,19 @@
+{
+  "timestamp": "20250127_163450",
+  "metrics_collected": [
+    "spatial",
+    "temporal",
+    "performance",
+    "validation"
+  ],
+  "total_records": {
+    "spatial": 2,
+    "temporal": 2,
+    "performance": 0,
+    "validation": 2
+  },
+  "variables_monitored": [
+    "SSH",
+    "SST"
+  ]
+}

@@ -1,0 +1,7 @@
+variable,min_value,max_value,mean_value,std_value,missing_pct,timestamp
+SSH,-155.36361694335938,108.67882537841797,-14.373331069946289,34.139488220214844,"<xarray.DataArray 'SSH' ()> Size: 8B
+dask.array<mul, shape=(), dtype=float64, chunksize=(), chunktype=numpy.ndarray>",2025-01-27 16:31:51
+SST,-1.908656358718872,32.26394271850586,12.449926376342773,11.268948554992676,"<xarray.DataArray 'SST' ()> Size: 8B
+dask.array<mul, shape=(), dtype=float64, chunksize=(), chunktype=numpy.ndarray>
+Coordinates:
+    z_t      float32 4B ...",2025-01-27 16:33:40
