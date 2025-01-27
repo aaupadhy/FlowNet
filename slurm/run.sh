@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:a100:2
+#SBATCH --gres=gpu:4
 #SBATCH --mem=140G
 #SBATCH --time=15:00:00
 
@@ -24,15 +24,34 @@ echo "ssh -N -L 8787:${COMPUTE_NODE}:8787 aaupadhy@grace.hprc.tamu.edu"
 source ~/.bashrc
 conda activate ML
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
 export MKL_NUM_THREADS=8
 export NUMEXPR_NUM_THREADS=8
 export OMP_NUM_THREADS=8
+
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=0
+export NCCL_P2P_DISABLE=0
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export WORLD_SIZE=4
+export MKL_NUM_THREADS=8
+export NUMEXPR_NUM_THREADS=8
+export OMP_NUM_THREADS=8
+
+MASTER_PORT=$(shuf -i 29500-29999 -n 1)
 
 echo "Job started at $(date)"
 echo "Running on ${COMPUTE_NODE}.grace.hprc.tamu.edu"
 nvidia-smi
 
-torchrun --rdzv_backend=c10d --standalone --nproc_per_node=2 main.py --mode all
+torchrun \
+    --nnodes=1 \
+    --nproc_per_node=4 \
+    --master_port=$MASTER_PORT \
+    --master_addr="127.0.0.1" \
+    --node_rank=0 \
+    --max_restarts=0 \
+    --start_method=spawn \
+    main.py --mode all
 
 echo "Job finished at $(date)"

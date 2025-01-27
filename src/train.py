@@ -21,6 +21,12 @@ from src.utils.training_monitor import TrainingMonitor
 import torch.cuda.amp
 from torch.cuda.amp import autocast
 
+def setup_random_seeds(rank):
+    seed = 42
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+
 def setup_distributed():
     if torch.cuda.device_count() > 1:
         if not dist.is_initialized():
@@ -41,23 +47,21 @@ class OceanTrainer:
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.device = torch.device(f'cuda:{self.local_rank}')
         self.rank, self.world_size = setup_distributed()
-        
-        # Model setup
+        setup_random_seeds(self.rank)
         if self.world_size > 1:
             model = model.to(self.device)
-            self.model = DDP(model, 
+            self.model = DDP(model,
                            device_ids=[self.local_rank],
                            gradient_as_bucket_view=True,
                            find_unused_parameters=False)
         else:
             self.model = model.to(self.device)
-
+        self.sync_model()
         self.config = config
         self.save_dir = Path(save_dir)
         self.logger = logging.getLogger(__name__)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-
-        # Initialize wandb on rank 0
+        
         if self.rank == 0:
             run_name = f"ocean_transformer_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             if not wandb.run:
@@ -69,8 +73,7 @@ class OceanTrainer:
                 )
                 self.monitor = TrainingMonitor(config, save_dir)
                 self.monitor.log_model_summary(model)
-
-        # Initialize training components
+        
         self.criterion = nn.SmoothL1Loss(reduction='mean')
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -94,26 +97,29 @@ class OceanTrainer:
         if self.rank == 0:
             self.logger.info(f"Initialized OneCycleLR scheduler with {steps_per_epoch} steps per epoch")
 
+
+    def sync_model(self):
+        if self.world_size > 1:
+            for param in self.model.parameters():
+                dist.broadcast(param.data, src=0)
+
     def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean,
                           ssh_mean, ssh_std, sst_mean, sst_std, shape):
         debug_mode = self.config['training'].get('debug_mode', False)
         debug_samples = self.config['training'].get('debug_samples', 32)
         
-        # Create dataset
         dataset = OceanDataset(
             ssh_data, sst_data, heat_transport_data, heat_transport_mean,
             ssh_mean, ssh_std, sst_mean, sst_std, shape,
             debug=debug_mode
         )
 
-        # Handle seed for reproducibility
         if self.world_size > 1:
             generator = torch.Generator()
             generator.manual_seed(self.config.get('seed', 42))
         else:
             generator = None
 
-        # Calculate splits
         total_size = len(dataset)
         if debug_mode:
             train_size = debug_samples // 2
@@ -124,17 +130,14 @@ class OceanTrainer:
             val_size = int(0.15 * total_size)
             test_size = total_size - train_size - val_size
 
-        # Split dataset
         train_dataset, val_dataset, test_dataset = random_split(
             dataset, [train_size, val_size, test_size],
             generator=generator
         )
 
-        # Calculate local batch size for distributed training
         global_batch_size = self.config['training']['batch_size']
         local_batch_size = global_batch_size // self.world_size if self.world_size > 1 else global_batch_size
 
-        # Create distributed sampler for training
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=self.world_size,
@@ -143,7 +146,6 @@ class OceanTrainer:
             seed=self.config.get('seed', 42)
         ) if self.world_size > 1 else None
 
-        # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=local_batch_size,
@@ -152,7 +154,8 @@ class OceanTrainer:
             pin_memory=True,
             num_workers=4,
             persistent_workers=True,
-            drop_last=True
+            drop_last=True,
+            prefetch_factor=2
         )
 
         val_loader = DataLoader(
@@ -186,45 +189,48 @@ class OceanTrainer:
 
         for ssh, sst, attention_mask, target in val_loader:
             batch_start = time.time()
-            
-            # Move data to device
-            ssh = ssh.to(self.device)
-            sst = sst.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            target = target.to(self.device)
+            ssh = ssh.to(self.device, non_blocking=True)
+            sst = sst.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
 
-            # Forward pass with mixed precision
-            with autocast():
-                output, attention_maps = self.model(ssh, sst, attention_mask)
-                loss = self.criterion(output, target)
+            try:
+                with autocast():
+                    output, attention_maps = self.model(ssh, sst, attention_mask)
+                    loss = self.criterion(output, target)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    torch.cuda.empty_cache()
+                    self.logger.error(f"OOM in validation: {str(e)}")
+                raise
 
             val_loss += loss.item()
             predictions.extend(output.cpu().numpy())
             targets.extend(target.cpu().numpy())
             batch_times.append(time.time() - batch_start)
 
-        # Average loss over batches
+            # Clear cache after each batch
+            del output, attention_maps, loss
+            torch.cuda.empty_cache()
+
         val_loss = val_loss / len(val_loader)
         predictions = np.array(predictions)
         targets = np.array(targets)
 
-        # Gather results from all processes if distributed
         if self.world_size > 1:
-            # Gather loss
             val_metrics = torch.tensor([val_loss, len(predictions)], device=self.device)
             dist.all_reduce(val_metrics)
             val_loss = val_metrics[0].item() / self.world_size
-
-            # Gather predictions and targets
+            
             all_predictions = [None for _ in range(self.world_size)]
             all_targets = [None for _ in range(self.world_size)]
+            
             dist.all_gather_object(all_predictions, predictions.tolist())
             dist.all_gather_object(all_targets, targets.tolist())
             
             predictions = np.concatenate([np.array(p) for p in all_predictions])
             targets = np.concatenate([np.array(t) for t in all_targets])
 
-        # Calculate metrics
         r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
         rmse = np.sqrt(np.mean((targets - predictions) ** 2))
 
@@ -236,6 +242,10 @@ class OceanTrainer:
         }
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader, start_epoch: int = 0):
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            for dev in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(dev)
         try:
             if self.scheduler is None:
                 self.setup_scheduler(train_loader)
@@ -253,6 +263,11 @@ class OceanTrainer:
                 self.logger.info(f"Batch size: {self.config['training']['batch_size']}")
 
             for epoch in range(start_epoch, self.config['training']['epochs']):
+                if hasattr(train_loader.sampler, 'set_epoch'):
+                    train_loader.sampler.set_epoch(epoch)
+                    
+                if self.world_size > 1:
+                    dist.barrier() 
                 if train_loader.sampler and isinstance(train_loader.sampler, DistributedSampler):
                     train_loader.sampler.set_epoch(epoch)
 
@@ -268,19 +283,34 @@ class OceanTrainer:
                     try:
                         batch_start = time.time()
                         
-                        ssh = ssh.to(self.device)
-                        sst = sst.to(self.device)
-                        attention_mask = attention_mask.to(self.device)
-                        target = target.to(self.device)
+                        # Move data to GPU with non_blocking=True
+                        ssh = ssh.to(self.device, non_blocking=True)
+                        sst = sst.to(self.device, non_blocking=True)
+                        attention_mask = attention_mask.to(self.device, non_blocking=True)
+                        target = target.to(self.device, non_blocking=True)
 
-                        with autocast():
-                            output, attention_maps = self.model(ssh, sst, attention_mask)
-                            loss = self.criterion(output, target)
-                            loss = loss / accumulation_steps
+                        # Clear gradients
+                        self.optimizer.zero_grad(set_to_none=True)
 
+                        try:
+                            with autocast():
+                                output, attention_maps = self.model(ssh, sst, attention_mask)
+                                loss = self.criterion(output, target)
+                                loss = loss / accumulation_steps
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                torch.cuda.empty_cache()
+                                self.logger.error(f"OOM in forward pass: {str(e)}")
+                            raise
+
+                        if self.world_size > 1:
+                            torch.distributed.barrier() 
                         self.scaler.scale(loss).backward()
 
                         if (i + 1) % accumulation_steps == 0:
+                            if dist.is_initialized():
+                                dist.barrier()
+
                             self.scaler.unscale_(self.optimizer)
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters(),
@@ -288,7 +318,6 @@ class OceanTrainer:
                             )
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
-                            self.optimizer.zero_grad(set_to_none=True)
                             self.scheduler.step()
 
                         batch_loss = loss.item() * accumulation_steps
@@ -296,24 +325,32 @@ class OceanTrainer:
                         batch_time = time.time() - batch_start
                         batch_times.append(batch_time)
 
+                        # Logging for rank 0
                         if self.rank == 0 and i % 10 == 0:
-                            predictions = output.detach().cpu().numpy()
-                            targets = target.detach().cpu().numpy()
-                            batch_r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
-                            
-                            self.logger.info(
-                                f"Batch {i}/{total_batches} | "
-                                f"Loss: {batch_loss:.4f} | "
-                                f"R²: {batch_r2:.4f} | "
-                                f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
-                            )
-                            wandb.log({
-                                'batch/loss': batch_loss,
-                                'batch/r2': batch_r2,
-                                'batch/learning_rate': self.scheduler.get_last_lr()[0],
-                                'batch/time': batch_time,
-                                'batch/memory_allocated': torch.cuda.memory_allocated() / 1024**3
-                            })
+                            with torch.no_grad():
+                                predictions = output.detach().cpu().numpy()
+                                targets = target.detach().cpu().numpy()
+                                batch_r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
+                                
+                                self.logger.info(
+                                    f"Batch {i}/{total_batches} | "
+                                    f"Loss: {batch_loss:.4f} | "
+                                    f"R²: {batch_r2:.4f} | "
+                                    f"LR: {self.scheduler.get_last_lr()[0]:.2e} | "
+                                    f"Time: {batch_time:.2f}s"
+                                )
+
+                                wandb.log({
+                                    'batch/loss': batch_loss,
+                                    'batch/r2': batch_r2,
+                                    'batch/learning_rate': self.scheduler.get_last_lr()[0],
+                                    'batch/time': batch_time,
+                                    'batch/memory_allocated': torch.cuda.memory_allocated() / 1024**3
+                                })
+
+                        # Clear memory after each batch
+                        del output, attention_maps, loss
+                        torch.cuda.empty_cache()
 
                     except Exception as e:
                         self.logger.error(f"Error in batch {i}: {str(e)}")
@@ -360,6 +397,7 @@ class OceanTrainer:
                         self.logger.info(f"Early stopping triggered after {epoch + 1} epochs")
                         break
 
+                # Synchronize at the end of each epoch
                 if self.world_size > 1:
                     dist.barrier()
 
@@ -398,7 +436,7 @@ class OceanTrainer:
             wandb.run.summary["best_val_loss"] = metrics['val_loss']
             wandb.run.summary["best_epoch"] = epoch
             wandb.save(str(best_path))
-            
+
         if epoch % self.config['training']['save_freq'] == 0:
             periodic_path = checkpoint_dir / f'checkpoint_epoch_{epoch}.pt'
             torch.save(checkpoint, periodic_path)
@@ -422,8 +460,8 @@ class OceanTrainer:
 
         if checkpoint['scheduler_state_dict'] and self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.scaler.load_state_dict(checkpoint['scaler'])
 
+        self.scaler.load_state_dict(checkpoint['scaler'])
         torch.set_rng_state(checkpoint['rng_state'])
         if torch.cuda.is_available() and checkpoint['cuda_rng_state'] is not None:
             torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
@@ -446,19 +484,29 @@ class OceanTrainer:
             self.logger.info("Starting model evaluation...")
 
         for ssh, sst, attention_mask, target in test_loader:
-            ssh = ssh.to(self.device)
-            sst = sst.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            target = target.to(self.device)
+            ssh = ssh.to(self.device, non_blocking=True)
+            sst = sst.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
 
-            with autocast():
-                output, attn_map = self.model(ssh, sst, attention_mask)
-                loss = self.criterion(output, target)
+            try:
+                with autocast():
+                    output, attn_map = self.model(ssh, sst, attention_mask)
+                    loss = self.criterion(output, target)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    torch.cuda.empty_cache()
+                    self.logger.error(f"OOM in evaluation: {str(e)}")
+                raise
 
             predictions.extend((output.cpu() + heat_transport_mean).numpy())
             targets.extend((target.cpu() + heat_transport_mean).numpy())
             attention_maps.append(attn_map.cpu().numpy())
             test_losses.append(loss.item())
+
+            # Clear memory after each batch
+            del output, attn_map, loss
+            torch.cuda.empty_cache()
 
         if self.world_size > 1:
             all_predictions = [None for _ in range(self.world_size)]
@@ -525,11 +573,12 @@ class OceanTrainer:
                 'targets': targets.tolist(),
                 'attention_maps': attention_maps.tolist()
             }
+
             results_path = self.save_dir / 'test_results.pt'
             torch.save(results, results_path)
             wandb.save(str(results_path))
 
         if self.rank == 0:
             self.logger.info("Evaluation completed")
-
+        
         return metrics, predictions, attention_maps

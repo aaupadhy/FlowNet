@@ -11,6 +11,7 @@ from datetime import datetime
 import torch
 import traceback
 import wandb
+from datetime import timedelta
 from src.models.transformer import OceanTransformer
 from src.data.process_data import OceanDataProcessor, OceanDataset
 from src.utils.visualization import OceanVisualizer
@@ -31,6 +32,12 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+def setup_random_seeds(rank):
+    seed = 42
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
 
 def setup_directories(config):
     """Ensure all required directories exist"""
@@ -137,7 +144,6 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
     torch.backends.cudnn.benchmark = True
     
     try:
-        # Get heat transport data
         with dask_monitor.monitor_operation("training_data_preparation"):
             ssh, sst, tlat, tlong = data_processor.get_spatial_data()
             config['data'].update({
@@ -147,7 +153,6 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
             heat_transport, heat_transport_mean = data_processor.calculate_heat_transport()
             logger.info(f"Using heat transport mean: {heat_transport_mean}")
 
-        # Model setup
         spatial_size = (data_processor.shape[1], data_processor.shape[2])
         model = OceanTransformer(
             spatial_size=spatial_size,
@@ -231,6 +236,25 @@ def train_model(config: dict, data_processor: OceanDataProcessor, local_rank: in
         logger.error(traceback.format_exc())
         raise
 
+def init_distributed():
+    """Initialize distributed training."""
+    if torch.cuda.device_count() > 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        
+        # Initialize process group with timeout
+        os.environ["NCCL_DEBUG"] = "INFO"
+        os.environ["NCCL_IB_TIMEOUT"] = "45" 
+        os.environ["NCCL_SOCKET_TIMEOUT"] = "45"
+        
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            timeout=timedelta(minutes=5)  # Fixed timedelta reference
+        )
+        return local_rank, dist.get_world_size()
+    return 0, 1
+
 def main():
     parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
     parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
@@ -239,31 +263,51 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     args = parser.parse_args()
-
-    # Set local rank from environment variable if available
-    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    
+    local_rank = 0
+    world_size = 1
+    client = None
     
     try:
-        config = load_config(args.config)
-        setup_directories(config)
+        local_rank, world_size = init_distributed()
         
-        # Initialize distributed training
-        if torch.cuda.device_count() > 1:
-            if not dist.is_initialized():
-                torch.cuda.set_device(local_rank)
-                dist.init_process_group(backend='nccl')
-                
-        with dask_monitor.monitor_operation("initialization"):
-            client = dask_monitor.setup_optimal_cluster(config['dask'])
+        config = load_config(args.config)
+        
+        if local_rank == 0:
+            setup_directories(config)
+        
+        if world_size > 1:
+            try:
+                dist.barrier()
+            except Exception as e:
+                logger.error(f"Failed at directory setup barrier: {str(e)}")
+                raise
+        
+        if local_rank == 0:
+            try:
+                with dask_monitor.monitor_operation("initialization"):
+                    client = dask_monitor.setup_optimal_cluster(config['dask'])
+            except Exception as e:
+                logger.error(f"Failed to initialize dask: {str(e)}")
+                raise
+        
+        if world_size > 1:
+            try:
+                dist.barrier()
+            except Exception as e:
+                logger.error(f"Failed at dask init barrier: {str(e)}")
+                raise
+        
+        try:
             data_processor = OceanDataProcessor(
                 ssh_path=config['paths']['ssh_zarr'],
                 sst_path=config['paths']['sst_zarr'],
                 vnt_path=config['paths']['vnt_zarr']
             )
-            
-        # if args.mode in ['analyze', 'all']:
-        #     analyze_data(config, data_processor)
-            
+        except Exception as e:
+            logger.error(f"Failed to create data processor: {str(e)}")
+            raise
+        
         if args.mode in ['train', 'all']:
             train_model(config, data_processor, local_rank)
             
@@ -272,12 +316,19 @@ def main():
         logger.error(traceback.format_exc())
         if wandb.run:
             wandb.finish()
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
         sys.exit(1)
+        
     finally:
         logger.info("Cleaning up resources...")
         if wandb.run:
             wandb.finish()
-        dask_monitor.shutdown()
+        if local_rank == 0 and client is not None:
+            dask_monitor.shutdown()
+        # Ensure clean process group shutdown
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

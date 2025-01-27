@@ -30,8 +30,7 @@ class OceanDataProcessor:
         self.cache_dir = Path('/scratch/user/aaupadhy/college/RA/final_data/cache')
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Calculate optimal chunk sizes based on available resources
-        time_chunk = min(180, 3240 // self.world_size)  # Divide time dimension by number of GPUs
+        time_chunk = 180
         base_chunks = {'time': time_chunk, 'nlat': 'auto', 'nlon': 'auto'}
         
         with dask_monitor.profile_task("load_datasets"):
@@ -305,6 +304,11 @@ class OceanDataset(Dataset):
 
     def __getitem__(self, idx):
         try:
+            if torch.distributed.is_initialized():
+                worker_info = torch.utils.data.get_worker_info()
+                if worker_info is not None:
+                    logging.debug(f"Rank {self.rank}, Worker {worker_info.id}: Loading idx {idx}")
+            
             ssh_data, sst_data = dask.compute(
                 self.ssh.isel(time=idx),
                 self.sst.isel(time=idx)
@@ -315,7 +319,6 @@ class OceanDataset(Dataset):
             ssh_valid = ~np.isnan(ssh_vals)
             sst_valid = ~np.isnan(sst_vals)
 
-            # Normalize data
             ssh_norm = np.zeros_like(ssh_vals, dtype=np.float32)
             sst_norm = np.zeros_like(sst_vals, dtype=np.float32)
             
@@ -339,7 +342,9 @@ class OceanDataset(Dataset):
             mask_downsampled = F.avg_pool2d(mask_tensor.unsqueeze(0).unsqueeze(0),
                                           kernel_size=2, 
                                           stride=2).squeeze(0).squeeze(0)
-
+            if torch.distributed.is_initialized():
+                logging.debug(f"Rank {self.rank}: Successfully loaded idx {idx}")
+            
             return (
                 ssh_downsampled,
                 sst_downsampled,

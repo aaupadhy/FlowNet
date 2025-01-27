@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional
 import json
 from pathlib import Path
 import pandas as pd
+import os
 
 class ChunkProfiler:
     def __init__(self, logger):
@@ -145,40 +146,74 @@ class DaskManager:
             self.logger.info(f"Memory Change: {mem_change:.2f}GB")
     
     def setup_optimal_cluster(self, data_analysis: Dict[str, Any]) -> Client:
-        """Setup optimized Dask cluster"""
         with self.monitor_operation("cluster_setup"):
-            n_workers = 2
-            mem_per_worker = int(self.total_memory * 0.95 / n_workers)
+            # Check if we're in a distributed setting
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
             
-            self.logger.info(f"Setting up cluster with {n_workers} workers")
-            self.logger.info(f"Memory per worker: {mem_per_worker}GB")
-            
-            dask.config.set({
-                'distributed.comm.timeouts.connect': '30s',
-                'distributed.comm.timeouts.tcp': '30s',
-                'distributed.nanny.daemon.exit-on-closed-stream': False,
-                'distributed.worker.memory.target': 0.6,    # Use 60% memory before spilling
-                'distributed.worker.memory.spill': 0.70,    # Spill at 70%
-                'distributed.worker.memory.pause': 0.75,    # Pause at 75%
-                'distributed.worker.memory.terminate': 0.80, # Terminate at 80%
-                'distributed.scheduler.work-stealing': False # Prevent task stealing between workers
-            })
-            
-            self.cluster = LocalCluster(
-                n_workers=2,
-                threads_per_worker=2,
-                memory_limit="60GB",
-                silence_logs=logging.WARNING,
-                dashboard_address=':8787',
-            )
-            
-            self.client = Client(self.cluster)
-            
-            self.logger.info(f"Dask dashboard available at: {self.client.dashboard_link}")
-        
-            self.client = Client(self.cluster)
-            return self.client 
+            # Only rank 0 should set up the dask cluster
+            if local_rank == 0:
+                n_workers = data_analysis.get('n_workers', 2)
+                mem_per_worker = int(self.total_memory * 0.95 / n_workers)
+                self.logger.info(f"Setting up cluster with {n_workers} workers")
+                self.logger.info(f"Memory per worker: {mem_per_worker}GB")
+                
+                # Configure dask settings
+                dask.config.set({
+                    'distributed.comm.timeouts.connect': '30s',
+                    'distributed.comm.timeouts.tcp': '30s',
+                    'distributed.nanny.daemon.exit-on-closed-stream': False,
+                    'distributed.worker.memory.target': 0.6,
+                    'distributed.worker.memory.spill': 0.70,
+                    'distributed.worker.memory.pause': 0.75,
+                    'distributed.worker.memory.terminate': 0.80,
+                    'distributed.scheduler.work-stealing': False
+                })
 
+                try:
+                    # Set up the cluster with dynamic port for dashboard if not rank 0
+                    dashboard_port = data_analysis.get('dashboard', {}).get('port', 8787)
+                    
+                    self.cluster = LocalCluster(
+                        n_workers=n_workers,
+                        threads_per_worker=data_analysis.get('threads_per_worker', 2),
+                        memory_limit=f"{mem_per_worker}GB",
+                        silence_logs=logging.WARNING,
+                        dashboard_address=f':{dashboard_port}' if local_rank == 0 else None,
+                        scheduler_port=0,  # Use dynamic port
+                        protocol='tcp',    # Explicitly use TCP
+                        processes=True     # Use processes instead of threads
+                    )
+
+                    self.client = Client(self.cluster)
+                    
+                    # Only log dashboard link for rank 0
+                    if local_rank == 0:
+                        self.logger.info(f"Dask dashboard available at: {self.client.dashboard_link}")
+                    
+                    # Set up resource monitoring if enabled
+                    if data_analysis.get('monitoring', {}).get('enabled', True):
+                        self._setup_monitoring(self.client)
+                    
+                    return self.client
+
+                except Exception as e:
+                    self.logger.error(f"Failed to set up dask cluster: {str(e)}")
+                    raise
+
+            else:
+                self.logger.info(f"Rank {local_rank}: Skipping dask cluster setup")
+                return None
+
+    def _setup_monitoring(self, client: Client) -> None:
+        """Set up basic monitoring for the dask cluster."""
+        try:
+            client.monitor_memory()
+            self.logger.info("Dask monitoring initialized successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to set up monitoring: {str(e)}")
+            # Continue without monitoring rather than failing
+            
     def auto_optimize_chunks(self, dask_array, operation_name: str):
         with self.monitor_operation(f"optimize_chunks_{operation_name}"):
             # Add memory safety check

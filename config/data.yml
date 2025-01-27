@@ -10,7 +10,12 @@ dask:
   n_workers: 4             
   threads_per_worker: 4         
   chunk_optimization: true      
-  monitor_chunks: true           
+  monitor_chunks: true    
+  worker_config:
+    memory_target: 0.6    # New: fraction of memory at which to start spilling to disk
+    memory_spill: 0.70    # New: fraction of memory at which to spill data to disk
+    memory_pause: 0.75    # New: fraction of memory at which to pause worker
+    memory_terminate: 0.80        
   dashboard:
     port: 8787                 
     verbose: true              
@@ -29,20 +34,20 @@ data:
     spatial_chunk_target: 300    
     preserve_dims: ['z_t']     
 
-monitoring:
-  enabled: true                 
-  save_metrics: true         
+monitoring:  # New section
+  enabled: true
   profiling:
-    enabled: true             
-    save_profiles: true         
-  spatial_monitoring: true      
-  temporal_monitoring: true    
-  memory_monitoring: true      
-  performance_monitoring: true  
-  log_level: "INFO"        
-  alerts:
-    memory_threshold: 0.90      
-    duration_threshold: 3600  
+    enabled: true
+    memory: true
+    performance: true
+    resource_tracking: true
+  memory_thresholds:
+    warning: 0.70     # Fraction of memory that triggers warning
+    critical: 0.85    # Fraction of memory that triggers critical warning
+  logging:
+    level: "INFO"
+    file: "dask_monitor.log"
+  dashboard_update_interval: 1000 
 
 visualization:
   dpi: 300
@@ -65,6 +70,7 @@ training:
     batch_size: 16
     learning_rate: 0.001
     epochs: 5
+    accumulation_steps: 8
     early_stopping_patience: 10
     validation_split: 0.15
     test_split: 0.15
