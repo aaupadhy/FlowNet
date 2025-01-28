@@ -80,6 +80,14 @@ class OceanVisualizer:
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
         self.logger.info(f"Plotting attention maps")
+        
+        if attention_maps.ndim > 2:
+            attention_maps = attention_maps.mean(axis=0)
+        
+        h, w = tlat.shape
+        attention_maps = np.array(attention_maps)
+        attention_maps = attention_maps[:h-1, :w-1] 
+
         fig = plt.figure(figsize=self.fig_size)
         gs = plt.GridSpec(1, 2, width_ratios=[1, 1])
         ax1 = fig.add_subplot(gs[0], projection=self.projection)
@@ -88,25 +96,26 @@ class OceanVisualizer:
         lon_min, lon_max = -80, 0
         lat_min, lat_max = 0, 65
 
-        # Plot 1: Heat Transport
         ax1.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
         ax1.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
         ax1.add_feature(cfeature.COASTLINE, linewidth=0.8)
         gl1 = ax1.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
         gl1.top_labels = False
         gl1.right_labels = False
+
+        tlong_mesh, tlat_mesh = np.meshgrid(tlong[:-1], tlat[:-1])
         
         mesh1 = ax1.pcolormesh(
-            tlong, tlat, attention_maps,
+            tlong_mesh, tlat_mesh, attention_maps,
             transform=self.projection,
             cmap='RdBu_r',
-            shading='auto'
+            shading='nearest'
         )
-        plt.colorbar(mesh1, ax=ax1, orientation='horizontal', pad=0.05, 
+        
+        plt.colorbar(mesh1, ax=ax1, orientation='horizontal', pad=0.05,
                     label='Meridional Heat Transport')
         ax1.set_title('Ocean Heat Transport Pattern')
 
-        # Plot 2: Attention Distribution
         attention_norm = attention_maps / np.max(attention_maps)
         ax2.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
         ax2.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
@@ -114,14 +123,15 @@ class OceanVisualizer:
         gl2 = ax2.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
         gl2.top_labels = False
         gl2.right_labels = False
-        
+
         mesh2 = ax2.pcolormesh(
-            tlong, tlat, attention_norm,
+            tlong_mesh, tlat_mesh, attention_norm,
             transform=self.projection,
             cmap='viridis',
-            shading='auto'
+            shading='nearest'
         )
-        plt.colorbar(mesh2, ax=ax2, orientation='horizontal', pad=0.05, 
+
+        plt.colorbar(mesh2, ax=ax2, orientation='horizontal', pad=0.05,
                     label='Normalized Attention')
         ax2.set_title('Spatial Attention Distribution')
 
@@ -132,6 +142,7 @@ class OceanVisualizer:
             plt.close()
             self.logger.info(f"Saved attention map to: {save_path}")
             return None
+
         return fig
 
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):

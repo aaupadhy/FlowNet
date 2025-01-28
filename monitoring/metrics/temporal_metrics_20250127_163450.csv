@@ -1,7 +1,0 @@
-variable,n_timesteps,temporal_coverage_pct,timestamp
-SSH,3240,"<xarray.DataArray 'SSH' ()> Size: 8B
-dask.array<mean_agg-aggregate, shape=(), dtype=float64, chunksize=(), chunktype=numpy.ndarray>",2025-01-27 16:29:59
-SST,3240,"<xarray.DataArray 'SST' ()> Size: 8B
-dask.array<mean_agg-aggregate, shape=(), dtype=float64, chunksize=(), chunktype=numpy.ndarray>
-Coordinates:
-    z_t      float32 4B ...",2025-01-27 16:29:59

@@ -136,18 +136,16 @@ class OceanTrainer:
         predictions = []
         targets = []
         batch_times = []
-        
-        # For progressive averaging
         attention_sum = None
         n_samples = 0
-
+        
         for ssh, sst, attention_mask, target in val_loader:
             batch_start = time.time()
             ssh = ssh.to(self.device, non_blocking=True)
             sst = sst.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-
+            
             try:
                 with autocast():
                     output, attn_maps = self.model(ssh, sst, attention_mask)
@@ -157,29 +155,34 @@ class OceanTrainer:
                     torch.cuda.empty_cache()
                     self.logger.error(f"OOM in validation: {str(e)}")
                 raise
-
+                
             val_loss += loss.item()
             predictions.extend(output.cpu().numpy())
             targets.extend(target.cpu().numpy())
             batch_times.append(time.time() - batch_start)
             
-            # Process attention maps for the current batch
+            # Process attention maps
             attn_numpy = attn_maps.cpu().numpy()
-            current_attention = attn_numpy.mean(axis=(0, 1))  # Mean over batch and heads
+            B, H, L, _ = attn_numpy.shape  # B=batch, H=heads, L=sequence length
+            h = int(np.sqrt(L))  # Calculate spatial dimension
             
-            # Update running average
+            # Average across batch and heads, reshape to spatial dimensions
+            current_attention = attn_numpy.mean(axis=(0, 1)).reshape(h, h)
+            
             if attention_sum is None:
-                attention_sum = current_attention
+                attention_sum = current_attention 
                 n_samples = 1
             else:
                 attention_sum = attention_sum + current_attention
                 n_samples += 1
-
+                
             del output, attn_maps, loss, current_attention
             torch.cuda.empty_cache()
 
+        # Calculate average attention map
         avg_attention_map = attention_sum / n_samples
-
+        
+        # Save attention visualization
         attention_dir = self.save_dir / 'attention_maps'
         attention_dir.mkdir(parents=True, exist_ok=True)
         attention_path = attention_dir / f'epoch_{self.current_epoch}.png'
@@ -192,12 +195,15 @@ class OceanTrainer:
             save_path=str(attention_path)
         )
 
+        # Calculate metrics
         val_loss = val_loss / len(val_loader)
         predictions = np.array(predictions)
         targets = np.array(targets)
+        
         r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
         rmse = np.sqrt(np.mean((targets - predictions) ** 2))
 
+        # Log to wandb
         if attention_path.exists():
             wandb.log({
                 f'attention_maps/epoch_{self.current_epoch}': wandb.Image(str(attention_path)),
@@ -212,7 +218,7 @@ class OceanTrainer:
             'val_rmse': rmse,
             'val_time': np.mean(batch_times)
         }
-        
+            
     def train(self, train_loader: DataLoader, val_loader: DataLoader, start_epoch: int = 0):
         attention_dir = self.save_dir / 'attention_maps'
         attention_dir.mkdir(parents=True, exist_ok=True)
