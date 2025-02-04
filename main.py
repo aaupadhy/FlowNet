@@ -11,6 +11,8 @@ import torch
 import traceback
 import wandb
 import numpy as np
+import shapely
+from shapely.geometry import shape, Point
 from src.models.transformer import OceanTransformer
 from src.data.process_data import OceanDataProcessor
 from src.utils.visualization import OceanVisualizer
