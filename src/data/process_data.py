@@ -201,7 +201,7 @@ class OceanDataset(torch.utils.data.Dataset):
                  ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False):
         self.logger = logging.getLogger(__name__)
         self.logger.info("Initializing OceanDataset")
-
+        
         if debug:
             self.ssh = ssh.isel(time=slice(0, 32))
             self.sst = sst.isel(time=slice(0, 32))
@@ -215,15 +215,15 @@ class OceanDataset(torch.utils.data.Dataset):
             self.heat_transport = heat_transport
             self.length = shape[0]
             self.logger.info(f"Dataset arrays computed. Shape: {self.ssh.shape}")
-
+            
         heat_transport_std = np.std(heat_transport)
-        self.heat_transport = (heat_transport - heat_transport_mean) / heat_transport_std
-
+        self.heat_transport = (heat_transport - heat_transport_mean) / (heat_transport_std + 1e-8)
+        
         self.ssh_mean = float(ssh_mean)
         self.ssh_std = float(ssh_std)
         self.sst_mean = float(sst_mean)
         self.sst_std = float(sst_std)
-
+        
         self.logger.info(f"Normalization parameters:")
         self.logger.info(f"  SSH mean: {self.ssh_mean:.4f}")
         self.logger.info(f"  SSH std:  {self.ssh_std:.4f}")
@@ -236,26 +236,27 @@ class OceanDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             self.logger.debug(f"Fetching item {idx}")
-            ssh_vals = self.ssh[idx].values
-            sst_vals = self.sst[idx].values
-
+            
+            ssh_vals = np.asarray(self.ssh[idx].values, dtype=np.float32)
+            sst_vals = np.asarray(self.sst[idx].values, dtype=np.float32)
+            
             self.logger.debug(f"Processing masks for item {idx}")
             ssh_valid = ~np.isnan(ssh_vals)
             sst_valid = ~np.isnan(sst_vals)
-
+            
             self.logger.debug(f"Normalizing data for item {idx}")
             ssh_norm = np.where(ssh_valid,
-                              (ssh_vals - self.ssh_mean) / (self.ssh_std + 1e-6),
+                              (ssh_vals - self.ssh_mean) / (self.ssh_std + 1e-8),
                               0)
             sst_norm = np.where(sst_valid,
-                              (sst_vals - self.sst_mean) / (self.sst_std + 1e-6),
+                              (sst_vals - self.sst_mean) / (self.sst_std + 1e-8),
                               0)
-
+            
             self.logger.debug(f"Creating tensors for item {idx}")
             ssh_tensor = torch.from_numpy(ssh_norm).float().unsqueeze(0)
             sst_tensor = torch.from_numpy(sst_norm).float().unsqueeze(0)
             mask_tensor = torch.from_numpy(ssh_valid & sst_valid).float()
-
+            
             self.logger.debug(f"Downsampling for item {idx}")
             ssh_downsampled = F.avg_pool2d(ssh_tensor.unsqueeze(0),
                                          kernel_size=2,
@@ -266,14 +267,16 @@ class OceanDataset(torch.utils.data.Dataset):
             mask_downsampled = F.avg_pool2d(mask_tensor.unsqueeze(0).unsqueeze(0),
                                           kernel_size=2,
                                           stride=2).squeeze(0).squeeze(0)
-
+            
+            target = torch.tensor(self.heat_transport[idx], dtype=torch.float32)
+            
             self.logger.debug(f"Successfully prepared item {idx}")
-            return (
-                ssh_downsampled,
-                sst_downsampled,
-                mask_downsampled,
-                torch.tensor(self.heat_transport[idx]).float()
-            )
+            
+            return (ssh_downsampled,
+                   sst_downsampled,
+                   mask_downsampled,
+                   target)
+                   
         except Exception as e:
             self.logger.error(f"Error in __getitem__ at index {idx}: {str(e)}")
             self.logger.error(traceback.format_exc())

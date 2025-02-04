@@ -8,6 +8,8 @@ from pathlib import Path
 import cmocean
 import logging
 import torch
+import shapely
+from shapely.geometry import Point, Polygon, shape
 from datetime import datetime
 from typing import Optional, Tuple, Union
 import matplotlib.colors as colors
@@ -80,22 +82,24 @@ class OceanVisualizer:
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
         self.logger.info(f"Plotting attention maps")
+        if len(attention_maps.shape) > 2:
+            attention_maps = np.mean(attention_maps, axis=tuple(range(len(attention_maps.shape)-2)))
         
-        if attention_maps.ndim > 2:
-            attention_maps = attention_maps.mean(axis=0)
+        land_mask = self._create_land_mask(attention_maps.shape)
+        attention_maps = np.ma.masked_array(attention_maps, mask=land_mask)
         
-        h, w = tlat.shape
-        attention_maps = np.array(attention_maps)
-        attention_maps = attention_maps[:h-1, :w-1] 
-
+        h, w = attention_maps.shape
         fig = plt.figure(figsize=self.fig_size)
         gs = plt.GridSpec(1, 2, width_ratios=[1, 1])
         ax1 = fig.add_subplot(gs[0], projection=self.projection)
         ax2 = fig.add_subplot(gs[1], projection=self.projection)
-
+        
         lon_min, lon_max = -80, 0
         lat_min, lat_max = 0, 65
-
+        lons = np.linspace(lon_min, lon_max, w)
+        lats = np.linspace(lat_min, lat_max, h)
+        lon_mesh, lat_mesh = np.meshgrid(lons, lats)
+        
         ax1.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
         ax1.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
         ax1.add_feature(cfeature.COASTLINE, linewidth=0.8)
@@ -103,20 +107,17 @@ class OceanVisualizer:
         gl1.top_labels = False
         gl1.right_labels = False
 
-        tlong_mesh, tlat_mesh = np.meshgrid(tlong[:-1], tlat[:-1])
-        
         mesh1 = ax1.pcolormesh(
-            tlong_mesh, tlat_mesh, attention_maps,
+            lon_mesh, lat_mesh, attention_maps,
             transform=self.projection,
             cmap='RdBu_r',
-            shading='nearest'
+            shading='auto'
         )
-        
         plt.colorbar(mesh1, ax=ax1, orientation='horizontal', pad=0.05,
                     label='Meridional Heat Transport')
         ax1.set_title('Ocean Heat Transport Pattern')
 
-        attention_norm = attention_maps / np.max(attention_maps)
+        attention_norm = np.ma.masked_array(attention_maps / np.max(attention_maps), mask=land_mask)
         ax2.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
         ax2.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
         ax2.add_feature(cfeature.COASTLINE, linewidth=0.8)
@@ -125,16 +126,14 @@ class OceanVisualizer:
         gl2.right_labels = False
 
         mesh2 = ax2.pcolormesh(
-            tlong_mesh, tlat_mesh, attention_norm,
+            lon_mesh, lat_mesh, attention_norm,
             transform=self.projection,
             cmap='viridis',
-            shading='nearest'
+            shading='auto'
         )
-
         plt.colorbar(mesh2, ax=ax2, orientation='horizontal', pad=0.05,
                     label='Normalized Attention')
         ax2.set_title('Spatial Attention Distribution')
-
         plt.tight_layout()
 
         if save_path:
@@ -142,8 +141,49 @@ class OceanVisualizer:
             plt.close()
             self.logger.info(f"Saved attention map to: {save_path}")
             return None
-
         return fig
+
+    def _create_land_mask(self, shape):
+        mask = np.zeros(shape, dtype=bool)
+        h, w = shape
+        lons = np.linspace(-80, 0, w)
+        lats = np.linspace(0, 65, h)
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+        land = cfeature.NaturalEarthFeature('physical', 'land', '50m')
+        
+        for i in range(h):
+            for j in range(w):
+                point = (lon_grid[i,j], lat_grid[i,j])
+                for geom in land.geometries():
+                    if hasattr(geom, 'geoms'):  # MultiPolygon
+                        for subgeom in geom.geoms:
+                            coords = list(zip(*subgeom.exterior.coords.xy))
+                            if self._point_in_polygon(point, coords):
+                                mask[i,j] = True
+                                break
+                    else:  # Single Polygon
+                        coords = list(zip(*geom.exterior.coords.xy))
+                        if self._point_in_polygon(point, coords):
+                            mask[i,j] = True
+                            break
+        return mask
+
+    def _point_in_polygon(self, point, polygon):
+        x, y = point
+        n = len(polygon)
+        inside = False
+        p1x, p1y = polygon[0]
+        for i in range(n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        return inside
 
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
         self.logger.info(f"Plotting spatial pattern for {title}")

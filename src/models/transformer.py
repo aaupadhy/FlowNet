@@ -65,126 +65,173 @@ class MultiModalFusion(nn.Module):
         return fused
 
 class OceanTransformer(nn.Module):
-  def __init__(self, spatial_size: Tuple[int, int], d_model: int = 256, nhead: int = 8,
-              num_layers: int = 4, dim_feedforward: int = 512, dropout: float = 0.1):
-      super().__init__()
-      height, width = spatial_size
-      self.d_model = d_model
-      self.logger = logging.getLogger(__name__)
-      self.dropout = nn.Dropout(dropout)
-      h1, w1 = (height + 2*1 - 3) // 2 + 1, (width + 2*1 - 3) // 2 + 1
-      h2, w2 = (h1 + 2*1 - 3) // 2 + 1, (w1 + 2*1 - 3) // 2 + 1
-      h3, w3 = (h2 + 2*1 - 3) // 2 + 1, (w2 + 2*1 - 3) // 2 + 1
-      h4, w4 = (h3 + 2*1 - 3) // 2 + 1, (w3 + 2*1 - 3) // 2 + 1
-      self.logger.info(f"Spatial dimensions after convolutions: {h4}x{w4}")
-      self.ssh_encoder = nn.Sequential(
-          nn.Conv2d(1, 32, 3, stride=2, padding=1),
-          nn.BatchNorm2d(32),
-          nn.ReLU(),
-          nn.Conv2d(32, 48, 3, stride=2, padding=1),
-          nn.BatchNorm2d(48),
-          nn.ReLU(),
-          nn.Conv2d(48, 64, 3, stride=2, padding=1),
-          nn.BatchNorm2d(64),
-          nn.ReLU(),
-          nn.Conv2d(64, 64, 3, stride=2, padding=1),
-          nn.BatchNorm2d(64),
-          nn.ReLU()
-      )
-      self.sst_encoder = nn.Sequential(
-          nn.Conv2d(1, 32, 3, stride=2, padding=1),
-          nn.BatchNorm2d(32),
-          nn.ReLU(),
-          nn.Conv2d(32, 48, 3, stride=2, padding=1),
-          nn.BatchNorm2d(48),
-          nn.ReLU(),
-          nn.Conv2d(48, 64, 3, stride=2, padding=1),
-          nn.BatchNorm2d(64),
-          nn.ReLU(),
-          nn.Conv2d(64, 64, 3, stride=2, padding=1),
-          nn.BatchNorm2d(64),
-          nn.ReLU()
-      )
-      self.ssh_norm = nn.LayerNorm(64)
-      self.sst_norm = nn.LayerNorm(64)
-      self.fusion = MultiModalFusion(64, 64, d_model)
-      self.fusion_norm = nn.LayerNorm(d_model)
-      self.pos_encoder = SpatialPositionalEncoding(d_model, h4, w4, dropout)
-      encoder_layer = nn.TransformerEncoderLayer(
-          d_model=d_model,
-          nhead=nhead,
-          dim_feedforward=dim_feedforward,
-          dropout=dropout,
-          batch_first=True,
-          norm_first=True
-      )
-      self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-      self.final_norm = nn.LayerNorm(d_model)
-      self.pre_fc = nn.Sequential(
-          nn.Linear(d_model, d_model // 2),
-          nn.ReLU(),
-          nn.LayerNorm(d_model // 2),
-          nn.Dropout(dropout)
-      )
-      self.fc = nn.Sequential(nn.Linear(d_model // 2, d_model // 4),
-       nn.ReLU(),
-       nn.Linear(d_model // 4, 1))
-       
-  def _get_transformer_output_and_attention(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-      attention_maps = []
-      encoded = x
-      seq_len = encoded.shape[1]
-      
-      for layer in self.transformer_encoder.layers:
-          self_attn = layer.self_attn
-          attn_output, attn_weights = self_attn(encoded, encoded, encoded, need_weights=True)
-          attention_maps.append(attn_weights)
-          encoded = layer.norm1(encoded + self.dropout(attn_output))
-          encoded = layer.norm2(encoded + self.dropout(layer.linear2(layer.activation(layer.linear1(encoded)))))
-      
-      return encoded, torch.stack(attention_maps)
-       
-  def forward(self, ssh: torch.Tensor, sst: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-      def log_tensor_stats(tensor, name):
-          with torch.no_grad():
-              if torch.isnan(tensor).any():
-                  self.logger.warning(f"{name} contains NaN values!")
-              self.logger.info(f"{name} stats - Mean: {tensor.mean():.6f}, Std: {tensor.std():.6f}, Min: {tensor.min():.6f}, Max: {tensor.max():.6f}")
-      self.logger.info(f"Input shapes - SSH: {ssh.shape}, SST: {sst.shape}")
-      log_tensor_stats(ssh, "Input SSH")
-      log_tensor_stats(sst, "Input SST")
-      if ssh.dim() == 3:
-          ssh = ssh.unsqueeze(1)
-          sst = sst.unsqueeze(1)
-      ssh_feat = self.ssh_encoder(ssh)
-      log_tensor_stats(ssh_feat, "SSH after encoder")
-      sst_feat = self.sst_encoder(sst)
-      log_tensor_stats(sst_feat, "SST after encoder")
-      B, C, H, W = ssh_feat.shape
-      ssh_feat = self.ssh_norm(ssh_feat.permute(0, 2, 3, 1))
-      log_tensor_stats(ssh_feat, "SSH after norm")
-      sst_feat = self.sst_norm(sst_feat.permute(0, 2, 3, 1))
-      log_tensor_stats(sst_feat, "SST after norm")
-      fused = self.fusion(ssh_feat, sst_feat)
-      log_tensor_stats(fused, "After fusion")
-      fused = self.fusion_norm(fused)
-      log_tensor_stats(fused, "After fusion norm")
-      fused = self.pos_encoder(fused)
-      log_tensor_stats(fused, "After positional encoding")
-      fused = fused.reshape(B, H * W, self.d_model)
-      log_tensor_stats(fused, "Before transformer")
-      encoded, attention_maps = self._get_transformer_output_and_attention(fused, mask)
-      log_tensor_stats(encoded, "After transformer")
-      log_tensor_stats(attention_maps, "Attention maps")
-      out = self.final_norm(encoded.mean(dim=1))
-      log_tensor_stats(out, "After final norm")
-      out = self.pre_fc(out)
-      log_tensor_stats(out, "After pre_fc")
-      out = self.fc(out)
-      log_tensor_stats(out, "Final output")
-      return out.squeeze(-1), attention_maps
-      
-  @torch.no_grad()
-  def get_attention_maps(self, ssh: torch.Tensor, sst: torch.Tensor) -> torch.Tensor:
-      _, attention_maps = self.forward(ssh, sst)
-      return attention_maps
+    def __init__(self, spatial_size, d_model=256, nhead=8, num_layers=4, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+        self.d_model = d_model
+
+        self.ssh_encoder = nn.Sequential(
+            nn.Conv2d(1, d_model//4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//4),
+            nn.GELU(),
+            nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//2),
+            nn.GELU(),
+            nn.Identity()
+        )
+        
+        self.sst_encoder = nn.Sequential(
+            nn.Conv2d(1, d_model//4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//4),
+            nn.GELU(),
+            nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//2),
+            nn.GELU(),
+            nn.Identity()
+        )
+
+        self.ssh_norm = nn.LayerNorm([d_model//2, *[s//2 for s in spatial_size]])
+        self.sst_norm = nn.LayerNorm([d_model//2, *[s//2 for s in spatial_size]])
+        
+        self.ssh_proj = nn.Sequential(
+            nn.Linear(d_model//2, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout)
+        )
+        
+        self.sst_proj = nn.Sequential(
+            nn.Linear(d_model//2, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout)
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Linear(2*d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout)
+        )
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, spatial_size[0]*spatial_size[1]//4, d_model))
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=F.gelu,
+            batch_first=True,
+            norm_first=True 
+        )
+        
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        self.pre_fc = nn.Sequential(
+            nn.Linear(d_model, d_model//2),
+            nn.GELU(),
+            nn.LayerNorm(d_model//2),
+            nn.Dropout(dropout/2)
+        )
+        
+        self.final = nn.Linear(d_model//2, 1)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def _log_tensor_stats(self, tensor, name):
+        with torch.no_grad():
+            self.logger.info(
+                f"{name} stats - "
+                f"Mean: {tensor.mean():.6f}, "
+                f"Std: {tensor.std():.6f}, "
+                f"Min: {tensor.min():.6f}, "
+                f"Max: {tensor.max():.6f}"
+            )
+
+    def forward(self, ssh, sst, attention_mask=None):
+            self.logger.info(f"Input shapes - SSH: {ssh.shape}, SST: {sst.shape}")
+            self._log_tensor_stats(ssh, "Input SSH")
+            self._log_tensor_stats(sst, "Input SST")
+
+            # Encoder paths
+            ssh_encoded = self.ssh_encoder(ssh)
+            sst_encoded = self.sst_encoder(sst)
+            
+            self._log_tensor_stats(ssh_encoded, "SSH after encoder")
+            self._log_tensor_stats(sst_encoded, "SST after encoder")
+
+            # Apply layer normalization
+            ssh = self.ssh_norm(ssh_encoded)
+            sst = self.sst_norm(sst_encoded)
+            
+            self._log_tensor_stats(ssh, "SSH after norm")
+            self._log_tensor_stats(sst, "SST after norm")
+
+            # Reshape and project
+            batch_size = ssh.shape[0]
+            ssh = ssh.flatten(2).transpose(1, 2)
+            sst = sst.flatten(2).transpose(1, 2)
+            
+            ssh = self.ssh_proj(ssh)
+            sst = self.sst_proj(sst)
+            
+            self._log_tensor_stats(ssh, "SSH after projection")
+            self._log_tensor_stats(sst, "SST after projection")
+
+            # Concatenate and fuse modalities
+            x = torch.cat([ssh, sst], dim=-1)
+            x = self.fusion(x)
+            
+            self._log_tensor_stats(x, "After fusion")
+            x = F.layer_norm(x, [x.size(-1)])
+            self._log_tensor_stats(x, "After fusion norm")
+
+            # Add positional embeddings
+            x = x + self.pos_embedding[:, :x.size(1)]
+            self._log_tensor_stats(x, "After positional encoding")
+            
+            # Apply transformer
+            self._log_tensor_stats(x, "Before transformer")
+            if self.training:
+                x = torch.utils.checkpoint.checkpoint(self.transformer, x, use_reentrant=False)
+            else:
+                x = self.transformer(x)
+            self._log_tensor_stats(x, "After transformer")
+
+            # Compute attention weights from transformer output
+            attention_weights = F.softmax(x @ x.transpose(-2, -1) / np.sqrt(x.size(-1)), dim=-1)
+            self._log_tensor_stats(attention_weights, "Attention maps")
+            
+            # Apply attention pooling
+            x = torch.matmul(attention_weights, x)
+            
+            # Global pooling
+            x = x.mean(dim=1)
+            x = F.layer_norm(x, [x.size(-1)])
+            self._log_tensor_stats(x, "After final norm")
+
+            # Final prediction layers
+            x = self.pre_fc(x)
+            self._log_tensor_stats(x, "After pre_fc")
+            
+            x = self.final(x)
+            self._log_tensor_stats(x, "Final output")
+
+            return x, attention_weights
+
+    def get_attention_map(self):
+        """Returns the attention map from the last forward pass"""
+        if not hasattr(self, '_last_attention'):
+            raise RuntimeError("No attention map available. Run forward pass first.")
+        return self._last_attention
