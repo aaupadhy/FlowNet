@@ -13,7 +13,7 @@ import wandb
 import numpy as np
 import shapely
 from shapely.geometry import shape, Point
-from src.models.transformer import OceanTransformer
+from src.architecture.transformer import OceanTransformer
 from src.data.process_data import OceanDataProcessor
 from src.utils.visualization import OceanVisualizer
 from src.utils.dask_utils import dask_monitor

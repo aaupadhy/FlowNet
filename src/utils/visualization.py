@@ -66,18 +66,27 @@ class OceanVisualizer:
             pass
 
     def _setup_ocean_map(self, ax):
-        ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-        ax.add_feature(cfeature.BORDERS, linestyle=':')
+        ax.set_extent([-80, 0, 10, 60], crs=self.projection)
         
-        # Gyre region focus 
-        lon_min, lon_max = -80, 0  # Atlantic focus
-        lat_min, lat_max = 10, 60  # Main gyre region
-        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
+        land = cfeature.NaturalEarthFeature(
+            'physical', 'land', '50m',
+            edgecolor='black',
+            facecolor='lightgray'
+        )
+        ax.add_feature(land, zorder=2)
         
-        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
+        gl = ax.gridlines(
+            draw_labels=True, 
+            linewidth=0.5, 
+            color='gray', 
+            alpha=0.5,
+            clip_box=ax.bbox 
+        )
         gl.top_labels = False
         gl.right_labels = False
+        
+        ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.8, zorder=3)
+        
         return gl
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
@@ -189,22 +198,48 @@ class OceanVisualizer:
         self.logger.info(f"Plotting spatial pattern for {title}")
         fig = plt.figure(figsize=self.fig_size)
         ax = plt.axes(projection=self.projection)
-        self._setup_ocean_map(ax)
         
-        # Properly mask the data
-        data_masked = np.ma.masked_invalid(data)
+        # Convert xarray to numpy arrays
+        data_np = data.values if hasattr(data, 'values') else np.array(data)
+        tlat_np = tlat.values if hasattr(tlat, 'values') else np.array(tlat)
+        tlong_np = tlong.values if hasattr(tlong, 'values') else np.array(tlong)
         
-        # Calculate robust percentiles for colorbar range
-        valid_data = data_masked.compressed()  # Get non-masked values
+        # Create initial mask for invalid/missing data
+        data_masked = np.ma.masked_invalid(data_np)
+        
+        # Detect and remove satellite swath edges
+        kernel_size = 3
+        for i in range(1, data_np.shape[0]-1):
+            for j in range(1, data_np.shape[1]-1):
+                neighborhood = data_np[i-1:i+2, j-1:j+2]
+                if not np.any(np.isnan(neighborhood)):
+                    # Calculate directional differences
+                    diag1 = np.abs(neighborhood[0,0] - neighborhood[2,2])
+                    diag2 = np.abs(neighborhood[0,2] - neighborhood[2,0])
+                    horiz = np.abs(neighborhood[1,0] - neighborhood[1,2])
+                    vert = np.abs(neighborhood[0,1] - neighborhood[2,1])
+                    
+                    # If diagonal differences are much larger than horizontal/vertical,
+                    # it's likely a swath edge
+                    if max(diag1, diag2) > 5 * min(horiz, vert):
+                        data_masked.mask[i,j] = True
+        
+        # Get valid data for colormap scaling
+        valid_data = data_masked.compressed()
         vmin, vmax = np.nanpercentile(valid_data, [2, 98])
+        
         self.logger.info(f"Data range - Min: {np.nanmin(valid_data):.4f}, Max: {np.nanmax(valid_data):.4f}")
         self.logger.info(f"Using colorbar range: [{vmin:.4f}, {vmax:.4f}]")
         
         if isinstance(cmap, str) and cmap.startswith('cmo.'):
             cmap = getattr(cmocean.cm, cmap[4:])
         
+        # Setup the map
+        self._setup_ocean_map(ax)
+        
+        # Create the plot
         mesh = ax.pcolormesh(
-            tlong, tlat, data_masked,
+            tlong_np, tlat_np, data_masked,
             transform=self.projection,
             cmap=cmap,
             vmin=vmin,
@@ -220,37 +255,25 @@ class OceanVisualizer:
             units = "(meters)"
         elif "SST" in title:
             units = "(°C)"
+        
         if units:
             ax.set_title(f"{title} {units}")
         else:
             ax.set_title(title)
-
+            
         if save_path:
             save_path = self.output_dir / 'plots' / f"{save_path}.png"
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             plt.close()
+            
             wandb.log({
                 f"spatial_patterns/{Path(save_path).stem}": wandb.Image(str(save_path))
             })
+            
             self.logger.info(f"Saved spatial pattern plot to {save_path}")
             return None
+            
         return fig
-
-    def _setup_ocean_map(self, ax):
-        """Helper function to set up a clean ocean map."""
-        ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-        ax.add_feature(cfeature.BORDERS, linestyle=':')
-        
-        lon_min, lon_max = -80, 0
-        lat_min, lat_max = 10, 60
-        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=self.projection)
-        
-        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
-        gl.top_labels = False
-        gl.right_labels = False
-        
-        return gl
 
     def plot_predictions(self, predictions, targets, time_indices=None, save_path=None):
         self.logger.info("Plotting model predictions vs targets")
