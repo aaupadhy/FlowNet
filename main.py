@@ -260,8 +260,8 @@ def main():
             logger.error(f"Failed to create data processor: {str(e)}")
             raise
 
-        if args.mode in ['analyze', 'all']:
-            ssh, sst = analyze_data(config, data_processor)
+        # if args.mode in ['analyze', 'all']:
+        #     ssh, sst = analyze_data(config, data_processor)
 
         if args.mode in ['train', 'all']:
             train_model(config, data_processor)

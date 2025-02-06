@@ -19,6 +19,30 @@ from src.utils.training_monitor import TrainingMonitor
 import torch.cuda.amp
 from torch.cuda.amp import autocast
 
+
+class AnomalyRegressionLoss(nn.Module):
+    def __init__(self, alpha=0.5, beta=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.mse = nn.MSELoss(reduction='none')
+        
+    def forward(self, pred, target):
+        mse_loss = self.mse(pred, target)
+        
+        target_std = torch.std(target)
+        anomaly_weight = torch.exp(self.beta * torch.abs(target) / target_std)
+        weighted_loss = mse_loss * anomaly_weight
+        
+        if pred.size(0) > 1:
+            temp_loss = self.mse(pred[1:] - pred[:-1], target[1:] - target[:-1])
+            temp_loss = temp_loss.mean()
+        else:
+            temp_loss = 0.0
+            
+        final_loss = (1 - self.alpha) * weighted_loss.mean() + self.alpha * temp_loss
+        return final_loss
+
 def setup_random_seeds():
     seed = 42
     torch.manual_seed(seed)
@@ -44,7 +68,7 @@ class OceanTrainer:
             self.monitor = TrainingMonitor(config, save_dir)
             self.monitor.log_model_summary(model)
 
-        self.criterion = nn.SmoothL1Loss()
+        self.criterion = AnomalyRegressionLoss(alpha=0.3,beta=1.5)
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config['training']['learning_rate'],
@@ -261,14 +285,14 @@ class OceanTrainer:
         batch_times = []
         attention_sum = None
         n_samples = 0
-
+        
         for ssh, sst, attention_mask, target in val_loader:
             batch_start = time.time()
             ssh = ssh.to(self.device, non_blocking=True)
             sst = sst.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-
+            
             try:
                 with autocast():
                     output, attn_maps = self.model(ssh, sst, attention_mask)
@@ -278,16 +302,21 @@ class OceanTrainer:
                     torch.cuda.empty_cache()
                     self.logger.error(f"OOM in validation: {str(e)}")
                 raise
-
+                
             val_loss += loss.item()
             predictions.extend(output.cpu().numpy())
             targets.extend(target.cpu().numpy())
             batch_times.append(time.time() - batch_start)
-
-            attn_numpy = attn_maps.cpu().numpy()
-            B, H, L, _ = attn_numpy.shape
-            h = int(np.sqrt(L))
-            current_attention = attn_numpy.mean(axis=(0, 1)).reshape(h, h)
+            
+            attn_numpy = attn_maps['combined'].cpu().numpy()
+            h = int(np.sqrt(attn_numpy.shape[1]))
+            try:
+                current_attention = attn_numpy.mean(axis=0).reshape(h, h)
+                current_attention = current_attention.reshape(h, h)
+            except ValueError as e:
+                self.logger.warning(f"Could not process attention map: {e}")
+                self.logger.info(f"Attention map shape: {attn_numpy.shape}")
+                current_attention = np.zeros((h, h))
             
             if attention_sum is None:
                 attention_sum = current_attention
@@ -295,15 +324,15 @@ class OceanTrainer:
             else:
                 attention_sum = attention_sum + current_attention
                 n_samples += 1
-
+                
             del output, attn_maps, loss
             torch.cuda.empty_cache()
-
+        
         avg_attention_map = attention_sum / n_samples
         attention_dir = self.save_dir / 'attention_maps'
         attention_dir.mkdir(parents=True, exist_ok=True)
         attention_path = attention_dir / f'epoch_{self.current_epoch}.png'
-
+        
         viz = OceanVisualizer(self.save_dir)
         viz.plot_attention_maps(
             avg_attention_map,
@@ -311,13 +340,13 @@ class OceanTrainer:
             self.config.get('data', {}).get('tlong', None),
             save_path=str(attention_path)
         )
-
+        
         val_loss = val_loss / len(val_loader)
         predictions = np.array(predictions)
         targets = np.array(targets)
         r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
         rmse = np.sqrt(np.mean((targets - predictions) ** 2))
-
+        
         if attention_path.exists():
             wandb.log({
                 f'attention_maps/epoch_{self.current_epoch}': wandb.Image(str(attention_path)),
@@ -325,14 +354,14 @@ class OceanTrainer:
                 'attention/max_value': float(np.max(avg_attention_map)),
                 'attention/sparsity': float(np.sum(avg_attention_map < 0.01) / avg_attention_map.size)
             })
-
+        
         return {
             'val_loss': val_loss,
             'val_r2': r2,
             'val_rmse': rmse,
             'val_time': np.mean(batch_times)
         }
-
+        
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
             'epoch': epoch,
@@ -397,54 +426,52 @@ class OceanTrainer:
         attention_sum = None
         n_samples = 0
         test_losses = []
-        
         self.logger.info("Starting model evaluation...")
-
+        
         for ssh, sst, attention_mask, target in test_loader:
             ssh = ssh.to(self.device, non_blocking=True)
             sst = sst.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-
+            
             try:
                 with autocast():
                     output, attn_maps = self.model(ssh, sst, attention_mask)
                     loss = self.criterion(output, target)
-
+                    
                 predictions.extend((output.cpu() + heat_transport_mean).numpy())
                 targets.extend((target.cpu() + heat_transport_mean).numpy())
                 test_losses.append(loss.item())
-
-                # Process attention maps same way as in validate
-                attn_numpy = attn_maps.cpu().numpy()
-                spatial_h = (ssh.shape[2] + 15) // 16
-                spatial_w = (ssh.shape[3] + 15) // 16
-                seq_len = spatial_h * spatial_w
                 
-                current_attention = attn_numpy.mean(axis=(0, 1))
-                current_attention = np.diag(current_attention)
-                current_attention = current_attention[:seq_len].reshape(spatial_h, spatial_w)
-
+                attn_numpy = attn_maps['combined'].cpu().numpy()
+                h = int(np.sqrt(attn_numpy.shape[1]))
+                try:
+                    current_attention = attn_numpy.mean(axis=0).reshape(h, h)
+                except ValueError as e:
+                    self.logger.warning(f"Could not process attention map: {e}")
+                    self.logger.info(f"Attention map shape: {attn_numpy.shape}")
+                    current_attention = np.zeros((h, h))
+                
                 if attention_sum is None:
                     attention_sum = current_attention
                     n_samples = 1
                 else:
                     attention_sum = attention_sum + current_attention
                     n_samples += 1
-
+                    
                 del output, attn_maps, loss, current_attention
                 torch.cuda.empty_cache()
-
+                
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     torch.cuda.empty_cache()
                     self.logger.error(f"OOM in evaluation: {str(e)}")
                 raise
-
+        
         predictions = np.array(predictions)
         targets = np.array(targets)
         avg_attention_map = attention_sum / n_samples
-
+        
         metrics = {
             'test_loss': np.mean(test_losses),
             'test_loss_std': np.std(test_losses),
@@ -452,11 +479,11 @@ class OceanTrainer:
             'test_rmse': np.sqrt(np.mean((targets - predictions) ** 2)),
             'test_mae': np.mean(np.abs(targets - predictions))
         }
-
+        
         self.logger.info(f"Test Metrics:")
         for k, v in metrics.items():
             self.logger.info(f"{k}: {v:.4f}")
-
+            
         wandb.run.summary.update({
             'test/loss': metrics['test_loss'],
             'test/loss_std': metrics['test_loss_std'],
@@ -464,16 +491,15 @@ class OceanTrainer:
             'test/rmse': metrics['test_rmse'],
             'test/mae': metrics['test_mae']
         })
-
-        viz = OceanVisualizer(self.save_dir)
         
+        viz = OceanVisualizer(self.save_dir)
         self.logger.info("Plotting final predictions...")
         viz.plot_predictions(
             predictions,
             targets,
             save_path='final_predictions'
         )
-
+        
         self.logger.info("Plotting final attention maps...")
         viz.plot_attention_maps(
             avg_attention_map,
@@ -481,16 +507,17 @@ class OceanTrainer:
             self.config.get('data', {}).get('tlong', None),
             save_path='final_attention_maps'
         )
-
+        
         results = {
             'metrics': metrics,
             'predictions': predictions.tolist(),
             'targets': targets.tolist(),
             'attention_maps': avg_attention_map.tolist()
         }
+        
         results_path = self.save_dir / 'test_results.pt'
         torch.save(results, results_path)
         wandb.save(str(results_path))
-
         self.logger.info("Evaluation completed")
-        return metrics, predictions, avg_attention_map
+        
+        return metrics, predictions, avg_attention_map 
