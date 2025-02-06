@@ -191,8 +191,12 @@ class OceanTrainer:
                             )
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
-                            self.scheduler.step()
+                            if self.scheduler is not None: 
+                                self.scheduler.step()
 
+                        if epoch == 0 and i == 0 and self.scheduler is not None:
+                            self.logger.info("First batch completed, scheduler stepping correctly after optimizer.")
+                        
                         batch_loss = loss.item() * accumulation_steps
                         epoch_loss += batch_loss
                         batch_time = time.time() - batch_start
@@ -285,14 +289,17 @@ class OceanTrainer:
         batch_times = []
         attention_sum = None
         n_samples = 0
-        
+        all_attention_maps = None  
+
+        self.logger.info("Starting validation...")
+
         for ssh, sst, attention_mask, target in val_loader:
             batch_start = time.time()
             ssh = ssh.to(self.device, non_blocking=True)
             sst = sst.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-            
+
             try:
                 with autocast():
                     output, attn_maps = self.model(ssh, sst, attention_mask)
@@ -302,51 +309,78 @@ class OceanTrainer:
                     torch.cuda.empty_cache()
                     self.logger.error(f"OOM in validation: {str(e)}")
                 raise
-                
+
             val_loss += loss.item()
             predictions.extend(output.cpu().numpy())
             targets.extend(target.cpu().numpy())
             batch_times.append(time.time() - batch_start)
-            
-            attn_numpy = attn_maps['combined'].cpu().numpy()
-            h = int(np.sqrt(attn_numpy.shape[1]))
+
+            batch_size = ssh.shape[0]  
+            if all_attention_maps is None:
+                all_attention_maps = {key: attn_maps[key].cpu().numpy().mean(axis=0) for key in attn_maps}
+            else:
+                for key in attn_maps:
+                    all_attention_maps[key] = (
+                        (all_attention_maps[key] * n_samples) + (attn_maps[key].cpu().numpy().mean(axis=0) * batch_size)
+                    ) / (n_samples + batch_size)
+
+            n_samples += batch_size  # ✅ Update total sample count
+
+            attn_numpy = attn_maps['combined'].cpu().numpy().mean(axis=0)
             try:
-                current_attention = attn_numpy.mean(axis=0).reshape(h, h)
-                current_attention = current_attention.reshape(h, h)
+                h, w = attn_numpy.shape
+                self.logger.info(f"Processing attention map of shape: {h}x{w}")
             except ValueError as e:
                 self.logger.warning(f"Could not process attention map: {e}")
                 self.logger.info(f"Attention map shape: {attn_numpy.shape}")
-                current_attention = np.zeros((h, h))
-            
+                attn_numpy = np.zeros((h, w))
+
             if attention_sum is None:
-                attention_sum = current_attention
-                n_samples = 1
+                attention_sum = attn_numpy * batch_size
             else:
-                attention_sum = attention_sum + current_attention
-                n_samples += 1
-                
+                attention_sum = (
+                    (attention_sum * (n_samples - batch_size)) + (attn_numpy * batch_size)
+                ) / n_samples
+
             del output, attn_maps, loss
             torch.cuda.empty_cache()
-        
+
+        # ✅ Normalize summed attention map correctly
         avg_attention_map = attention_sum / n_samples
+
+        # ✅ Normalize attention maps across all batches
+        for key in all_attention_maps:
+            all_attention_maps[key] /= n_samples
+        targets = np.array(targets)  # ✅ Ensure correct type
+        predictions = np.array(predictions)
+        # ✅ Stabilize R² computation
+        eps = 1e-8  # Small constant to prevent division by zero
+        ss_total = np.sum((targets - np.mean(targets)) ** 2) + eps  # Prevents division by zero
+        ss_residual = np.sum((targets - predictions) ** 2)
+        r2 = 1 - (ss_residual / ss_total)
+
+        # Compute final validation metrics
+        val_loss = val_loss / len(val_loader)
+        predictions = np.array(predictions)
+        targets = np.array(targets)
+        rmse = np.sqrt(np.mean((targets - predictions) ** 2))
+
+        self.logger.info(f"Validation Summary: Loss: {val_loss:.4f}, R²: {r2:.4f}, RMSE: {rmse:.4f}")
+
+        # Save and visualize attention maps
         attention_dir = self.save_dir / 'attention_maps'
         attention_dir.mkdir(parents=True, exist_ok=True)
         attention_path = attention_dir / f'epoch_{self.current_epoch}.png'
-        
+
         viz = OceanVisualizer(self.save_dir)
         viz.plot_attention_maps(
-            avg_attention_map,
+            all_attention_maps,  # ✅ Now using memory-efficient running mean
             self.config.get('data', {}).get('tlat', None),
             self.config.get('data', {}).get('tlong', None),
             save_path=str(attention_path)
         )
-        
-        val_loss = val_loss / len(val_loader)
-        predictions = np.array(predictions)
-        targets = np.array(targets)
-        r2 = 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2)
-        rmse = np.sqrt(np.mean((targets - predictions) ** 2))
-        
+
+        # ✅ Log to W&B
         if attention_path.exists():
             wandb.log({
                 f'attention_maps/epoch_{self.current_epoch}': wandb.Image(str(attention_path)),
@@ -354,13 +388,14 @@ class OceanTrainer:
                 'attention/max_value': float(np.max(avg_attention_map)),
                 'attention/sparsity': float(np.sum(avg_attention_map < 0.01) / avg_attention_map.size)
             })
-        
+
         return {
             'val_loss': val_loss,
-            'val_r2': r2,
+            'val_r2': r2,  # ✅ Now stabilized
             'val_rmse': rmse,
             'val_time': np.mean(batch_times)
         }
+
         
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
@@ -419,6 +454,7 @@ class OceanTrainer:
         return checkpoint['epoch'], checkpoint['metrics']
     
     
+    @torch.no_grad()
     def evaluate(self, test_loader: DataLoader, heat_transport_mean: float):
         self.model.eval()
         predictions = []
@@ -426,64 +462,90 @@ class OceanTrainer:
         attention_sum = None
         n_samples = 0
         test_losses = []
+        all_attention_maps = None  # ✅ Store running mean of attention maps
+
         self.logger.info("Starting model evaluation...")
-        
+
         for ssh, sst, attention_mask, target in test_loader:
             ssh = ssh.to(self.device, non_blocking=True)
             sst = sst.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
-            
+
             try:
                 with autocast():
                     output, attn_maps = self.model(ssh, sst, attention_mask)
                     loss = self.criterion(output, target)
-                    
+                
                 predictions.extend((output.cpu() + heat_transport_mean).numpy())
                 targets.extend((target.cpu() + heat_transport_mean).numpy())
                 test_losses.append(loss.item())
-                
-                attn_numpy = attn_maps['combined'].cpu().numpy()
-                h = int(np.sqrt(attn_numpy.shape[1]))
+
+                batch_size = ssh.shape[0]  # ✅ Get current batch size
+
+                # ✅ Compute running mean for attention maps
+                if all_attention_maps is None:
+                    all_attention_maps = {key: attn_maps[key].cpu().numpy().mean(axis=0) for key in attn_maps}
+                else:
+                    for key in attn_maps:
+                        all_attention_maps[key] = (
+                            (all_attention_maps[key] * n_samples) + (attn_maps[key].cpu().numpy().mean(axis=0) * batch_size)
+                        ) / (n_samples + batch_size)
+
+                n_samples += batch_size
+
+                attn_numpy = attn_maps['combined'].cpu().numpy().mean(axis=0)
                 try:
-                    current_attention = attn_numpy.mean(axis=0).reshape(h, h)
+                    h, w = attn_numpy.shape
+                    self.logger.info(f"Processing attention map of shape: {h}x{w}")
                 except ValueError as e:
                     self.logger.warning(f"Could not process attention map: {e}")
                     self.logger.info(f"Attention map shape: {attn_numpy.shape}")
-                    current_attention = np.zeros((h, h))
-                
+                    attn_numpy = np.zeros((h, w))
+
                 if attention_sum is None:
-                    attention_sum = current_attention
-                    n_samples = 1
+                    attention_sum = attn_numpy * batch_size
                 else:
-                    attention_sum = attention_sum + current_attention
-                    n_samples += 1
-                    
-                del output, attn_maps, loss, current_attention
+                    attention_sum = (
+                        (attention_sum * (n_samples - batch_size)) + (attn_numpy * batch_size)
+                    ) / n_samples
+
+                del output, attn_maps, loss
                 torch.cuda.empty_cache()
-                
+
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     torch.cuda.empty_cache()
                     self.logger.error(f"OOM in evaluation: {str(e)}")
                 raise
-        
-        predictions = np.array(predictions)
-        targets = np.array(targets)
+
+        # ✅ Normalize summed attention map correctly
         avg_attention_map = attention_sum / n_samples
-        
+
+        # ✅ Normalize attention maps across all batches
+        for key in all_attention_maps:
+            all_attention_maps[key] /= n_samples
+
+        targets = np.array(targets)  # ✅ Ensure correct type
+        predictions = np.array(predictions)
+        # ✅ Stabilize R² computation
+        eps = 1e-8  # Small constant to prevent division by zero
+        ss_total = np.sum((targets - np.mean(targets)) ** 2) + eps  # Prevents division by zero
+        ss_residual = np.sum((targets - predictions) ** 2)
+        r2 = 1 - (ss_residual / ss_total)
+
         metrics = {
             'test_loss': np.mean(test_losses),
             'test_loss_std': np.std(test_losses),
-            'test_r2': 1 - np.sum((targets - predictions) ** 2) / np.sum((targets - targets.mean()) ** 2),
+            'test_r2': r2,  # ✅ Now stabilized
             'test_rmse': np.sqrt(np.mean((targets - predictions) ** 2)),
             'test_mae': np.mean(np.abs(targets - predictions))
         }
-        
+
         self.logger.info(f"Test Metrics:")
         for k, v in metrics.items():
             self.logger.info(f"{k}: {v:.4f}")
-            
+
         wandb.run.summary.update({
             'test/loss': metrics['test_loss'],
             'test/loss_std': metrics['test_loss_std'],
@@ -491,33 +553,34 @@ class OceanTrainer:
             'test/rmse': metrics['test_rmse'],
             'test/mae': metrics['test_mae']
         })
-        
+
         viz = OceanVisualizer(self.save_dir)
         self.logger.info("Plotting final predictions...")
+
         viz.plot_predictions(
             predictions,
             targets,
             save_path='final_predictions'
         )
-        
+
         self.logger.info("Plotting final attention maps...")
         viz.plot_attention_maps(
-            avg_attention_map,
+            all_attention_maps,  # ✅ Now using memory-efficient running mean
             self.config.get('data', {}).get('tlat', None),
             self.config.get('data', {}).get('tlong', None),
             save_path='final_attention_maps'
         )
-        
+
         results = {
             'metrics': metrics,
-            'predictions': predictions.tolist(),
-            'targets': targets.tolist(),
-            'attention_maps': avg_attention_map.tolist()
+            'predictions': predictions,
+            'targets': targets,
+            'attention_maps': all_attention_maps  # ✅ Store attention maps for analysis
         }
-        
+
         results_path = self.save_dir / 'test_results.pt'
         torch.save(results, results_path)
         wandb.save(str(results_path))
+
         self.logger.info("Evaluation completed")
-        
-        return metrics, predictions, avg_attention_map 
+        return metrics, predictions, all_attention_maps

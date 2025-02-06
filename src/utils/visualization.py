@@ -4,6 +4,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import numpy as np
 import shapely
+import torch
 from pathlib import Path
 import cmocean
 import logging
@@ -33,38 +34,45 @@ class OceanVisualizer:
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
         self.logger.info(f"Plotting attention maps")
-        
-        ssh_attn = attention_maps['ssh'].mean(0).cpu().numpy()
-        sst_attn = attention_maps['sst'].mean(0).cpu().numpy()
-        cross_attn = attention_maps['cross'].mean(0).cpu().numpy()
-        
-        h = int(np.sqrt(ssh_attn.shape[0]))
-        w = h
-        
+
+        # Ensure the expected keys are in the dictionary
+        expected_keys = ['ssh', 'sst', 'cross']
+        missing_keys = [key for key in expected_keys if key not in attention_maps]
+        if missing_keys:
+            self.logger.error(f"Missing attention map keys: {missing_keys}")
+            return
+
+        try:
+            ssh_attn = attention_maps['ssh']
+            if not isinstance(ssh_attn, torch.Tensor):
+                raise TypeError(f"Expected torch.Tensor but got {type(ssh_attn)}")
+            
+            ssh_attn = ssh_attn.detach().cpu().numpy().mean(axis=0)
+
+            sst_attn = attention_maps['sst'].detach().cpu().numpy().mean(axis=0)
+            cross_attn = attention_maps['cross'].detach().cpu().numpy().mean(axis=0)
+        except Exception as e:
+            self.logger.error(f"Failed to process attention maps: {e}")
+            return
+
+        # Ensure shapes match expected visualization sizes
+        if ssh_attn.ndim != 2 or sst_attn.ndim != 2 or cross_attn.ndim != 2:
+            self.logger.error(f"Unexpected attention map shape. SSH: {ssh_attn.shape}, SST: {sst_attn.shape}")
+            return
+
+        # Proceed with visualization
+        h, w = ssh_attn.shape
         lons = np.linspace(-80, 0, w)
         lats = np.linspace(0, 65, h)
         lon_mesh, lat_mesh = np.meshgrid(lons, lats)
-        
-        land = cfeature.NaturalEarthFeature('physical', 'land', '50m')
-        ocean_mask = np.ones((h, w), dtype=bool)
-        points = np.column_stack((lon_mesh.ravel(), lat_mesh.ravel()))
-        for geom in land.geometries():
-            ocean_mask.ravel()[:] &= ~np.array([shapely.Point(p).within(geom) for p in points])
-        
-        # Setup figure
+
         fig = plt.figure(figsize=(20, 6))
         gs = plt.GridSpec(1, 3, width_ratios=[1, 1, 1])
-        
+
         titles = ['SSH Attention', 'SST Attention', 'Cross-Modal Attention']
-        attention_data = [
-            ssh_attn.reshape(h, w),
-            sst_attn.reshape(h, w),
-            cross_attn.reshape(h, w)
-        ]
-        
+        attention_data = [ssh_attn, sst_attn, cross_attn]
+
         for idx, (attn, title) in enumerate(zip(attention_data, titles)):
-            attn = np.ma.masked_array(attn, mask=~ocean_mask)
-            
             ax = fig.add_subplot(gs[idx], projection=self.projection)
             ax.set_extent([-80, 0, 0, 65], crs=self.projection)
             ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
@@ -72,8 +80,8 @@ class OceanVisualizer:
             gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
             gl.top_labels = False
             gl.right_labels = False
-            
-            vmin, vmax = np.nanpercentile(attn.compressed(), [2, 98])
+
+            vmin, vmax = np.nanpercentile(attn, [2, 98])
             mesh = ax.pcolormesh(
                 lon_mesh, lat_mesh, attn,
                 transform=self.projection,
@@ -82,18 +90,18 @@ class OceanVisualizer:
                 vmax=vmax,
                 shading='auto'
             )
-            plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05,
-                        label='Attention Strength')
+            plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05, label='Attention Strength')
             ax.set_title(title)
-        
+
         plt.tight_layout()
-        
         if save_path:
             plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
             plt.close()
             self.logger.info(f"Saved attention map to: {save_path}")
             return None
+
         return fig
+
     
     def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
         self.logger.info(f"Plotting spatial pattern for {title}")
