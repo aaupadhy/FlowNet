@@ -3,186 +3,115 @@ import seaborn as sns
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import numpy as np
-import shapely
-import torch
 from pathlib import Path
-import cmocean
 import logging
-from typing import Optional, Tuple, Union
+import json
+from scipy.ndimage import zoom
 
 class OceanVisualizer:
-    def __init__(self, output_dir: Union[str, Path], fig_size: tuple = (20, 8), dpi: int = 300):
+    def __init__(self, output_dir, fig_size=(20, 8), dpi=300):
         self.output_dir = Path(output_dir)
         self.fig_size = fig_size
         self.dpi = dpi
         self.logger = logging.getLogger(__name__)
+        for subdir in ['plots', 'attention_maps', 'predictions']:
+            (self.output_dir / subdir).mkdir(parents=True, exist_ok=True)
         self.projection = ccrs.PlateCarree()
-        for dir_name in ['plots', 'attention_maps', 'predictions']:
-            (self.output_dir / dir_name).mkdir(parents=True, exist_ok=True)
+    
+    def _get_geographic_grid(self, attn_shape, tlat, tlong):
+        # Use provided tlat/tlong or defaults.
+        if tlat is not None and tlong is not None:
+            lat_min, lat_max = np.min(tlat), np.max(tlat)
+            lon_min, lon_max = np.min(tlong), np.max(tlong)
+        else:
+            lat_min, lat_max = 0, 65
+            lon_min, lon_max = -80, 0
+        lat_grid = np.linspace(lat_min, lat_max, attn_shape[0] + 1)
+        lon_grid = np.linspace(lon_min, lon_max, attn_shape[1] + 1)
+        return lat_grid, lon_grid
 
-    def _setup_ocean_map(self, ax):
-        ax.set_extent([-80, 0, 10, 60], crs=self.projection)
-        land = cfeature.NaturalEarthFeature('physical', 'land', '50m',
-                                            edgecolor='black', facecolor='lightgray')
-        ax.add_feature(land, zorder=2)
-        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray',
-                        alpha=0.5, clip_box=ax.bbox)
-        gl.top_labels = False
-        gl.right_labels = False
-        ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.8, zorder=3)
-        return gl
+    def _regrid_attention(self, attn, target_shape):
+        # Upsample attention map to target_shape using linear interpolation.
+        zoom_factors = (target_shape[0] / attn.shape[0], target_shape[1] / attn.shape[1])
+        return zoom(attn, zoom_factors, order=1)
 
     def plot_attention_maps(self, attention_maps, tlat, tlong, save_path=None):
-        self.logger.info(f"Plotting attention maps")
-
-        # Ensure the expected keys are in the dictionary
+        self.logger.info("Plotting attention maps")
         expected_keys = ['ssh', 'sst', 'cross']
-        missing_keys = [key for key in expected_keys if key not in attention_maps]
-        if missing_keys:
-            self.logger.error(f"Missing attention map keys: {missing_keys}")
+        missing = [k for k in expected_keys if k not in attention_maps]
+        if missing:
+            self.logger.error(f"Missing keys in attention maps: {missing}")
             return
-
-        try:
-            ssh_attn = attention_maps['ssh']
-            if not isinstance(ssh_attn, torch.Tensor):
-                raise TypeError(f"Expected torch.Tensor but got {type(ssh_attn)}")
-            
-            ssh_attn = ssh_attn.detach().cpu().numpy().mean(axis=0)
-
-            sst_attn = attention_maps['sst'].detach().cpu().numpy().mean(axis=0)
-            cross_attn = attention_maps['cross'].detach().cpu().numpy().mean(axis=0)
-        except Exception as e:
-            self.logger.error(f"Failed to process attention maps: {e}")
-            return
-
-        # Ensure shapes match expected visualization sizes
-        if ssh_attn.ndim != 2 or sst_attn.ndim != 2 or cross_attn.ndim != 2:
-            self.logger.error(f"Unexpected attention map shape. SSH: {ssh_attn.shape}, SST: {sst_attn.shape}")
-            return
-
-        # Proceed with visualization
-        h, w = ssh_attn.shape
-        lons = np.linspace(-80, 0, w)
-        lats = np.linspace(0, 65, h)
-        lon_mesh, lat_mesh = np.meshgrid(lons, lats)
-
         fig = plt.figure(figsize=(20, 6))
-        gs = plt.GridSpec(1, 3, width_ratios=[1, 1, 1])
-
         titles = ['SSH Attention', 'SST Attention', 'Cross-Modal Attention']
-        attention_data = [ssh_attn, sst_attn, cross_attn]
-
-        for idx, (attn, title) in enumerate(zip(attention_data, titles)):
-            ax = fig.add_subplot(gs[idx], projection=self.projection)
-            ax.set_extent([-80, 0, 0, 65], crs=self.projection)
-            ax.add_feature(cfeature.LAND, facecolor='lightgray', edgecolor='black')
+        # Determine target grid dimensions from tlat/tlong or use defaults.
+        if tlat is not None and tlong is not None:
+            target_shape = (len(tlat), len(tlong))
+        else:
+            target_shape = (300, 300)
+        lat_grid, lon_grid = self._get_geographic_grid(target_shape, tlat, tlong)
+        for idx, key in enumerate(expected_keys):
+            ax = fig.add_subplot(1, 3, idx+1, projection=self.projection)
+            ax.set_extent([lon_grid[0], lon_grid[-1], lat_grid[0], lat_grid[-1]], crs=self.projection)
+            ax.add_feature(cfeature.LAND, facecolor='lightgray')
             ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
-            gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5)
-            gl.top_labels = False
-            gl.right_labels = False
-
-            vmin, vmax = np.nanpercentile(attn, [2, 98])
-            mesh = ax.pcolormesh(
-                lon_mesh, lat_mesh, attn,
-                transform=self.projection,
-                cmap='viridis',
-                vmin=vmin,
-                vmax=vmax,
-                shading='auto'
-            )
-            plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05, label='Attention Strength')
-            ax.set_title(title)
-
+            attn = attention_maps[key]
+            if attn is None:
+                self.logger.warning(f"No attention data for {key}")
+                continue
+            # Regrid the patch-level attention map to the geographic grid.
+            attn_regridded = self._regrid_attention(attn, target_shape)
+            vmin, vmax = np.nanpercentile(attn_regridded, [2, 98])
+            mesh = ax.pcolormesh(lon_grid, lat_grid, attn_regridded, cmap='viridis', shading='auto',
+                                   vmin=vmin, vmax=vmax, transform=self.projection)
+            plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05)
+            ax.set_title(titles[idx])
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+            sp = self.output_dir / 'attention_maps' / f"{save_path}.png"
+            plt.savefig(sp, dpi=self.dpi, bbox_inches='tight')
             plt.close()
-            self.logger.info(f"Saved attention map to: {save_path}")
-            return None
-
-        return fig
-
-    
-    def plot_spatial_pattern(self, data, tlat, tlong, title, cmap='cmo.thermal', save_path=None):
-        self.logger.info(f"Plotting spatial pattern for {title}")
-        fig = plt.figure(figsize=self.fig_size)
-        ax = plt.axes(projection=self.projection)
-        data_np = data.values if hasattr(data, 'values') else np.array(data)
-        tlat_np = tlat.values if hasattr(tlat, 'values') else np.array(tlat)
-        tlong_np = tlong.values if hasattr(tlong, 'values') else np.array(tlong)
-        data_masked = np.ma.masked_invalid(data_np)
-        kernel_size = 3
-        for i in range(1, data_np.shape[0]-1):
-            for j in range(1, data_np.shape[1]-1):
-                neighborhood = data_np[i-1:i+2, j-1:j+2]
-                if not np.any(np.isnan(neighborhood)):
-                    diag1 = np.abs(neighborhood[0,0] - neighborhood[2,2])
-                    diag2 = np.abs(neighborhood[0,2] - neighborhood[2,0])
-                    horiz = np.abs(neighborhood[1,0] - neighborhood[1,2])
-                    vert = np.abs(neighborhood[0,1] - neighborhood[2,1])
-                    if max(diag1, diag2) > 5 * min(horiz, vert):
-                        data_masked.mask[i,j] = True
-                        
-        valid_data = data_masked.compressed()
-        vmin, vmax = np.nanpercentile(valid_data, [2, 98])
-        self._setup_ocean_map(ax)
-        
-        mesh = ax.pcolormesh(
-            tlong_np, tlat_np, data_masked,
-            transform=self.projection,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            shading='auto'
-        )
-        cbar = plt.colorbar(mesh, ax=ax, orientation='horizontal', pad=0.05, extend='both')
-        cbar.set_label(title)
-        units = ""
-        if "SSH" in title:
-            units = "(meters)"
-        elif "SST" in title:
-            units = "(°C)"
-        if units:
-            ax.set_title(f"{title} {units}")
+            self.logger.info(f"Saved attention map to: {sp}")
         else:
-            ax.set_title(title)
-            
-        if save_path:
-            save_path = self.output_dir / 'plots' / f"{save_path}.png"
-            plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
-            plt.close()
-            self.logger.info(f"Saved spatial pattern plot to {save_path}")
-            return None
-        return fig
+            return fig
 
     def plot_predictions(self, predictions, targets, time_indices=None, save_path=None):
-        self.logger.info("Plotting model predictions vs targets")
+        self.logger.info("Plotting predictions vs targets")
         if time_indices is None:
             time_indices = np.arange(len(predictions))
-            
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        scatter = ax1.scatter(targets, predictions, alpha=0.5, c='blue')
-        ax1.plot([min(targets), max(targets)], [min(targets), max(targets)], 'r--')
-        ax1.set_xlabel('True Heat Transport (Normalized)')
-        ax1.set_ylabel('Predicted Heat Transport (Normalized)')
-        ax1.set_title('Prediction Accuracy')
-        
+        ax1.scatter(targets, predictions, alpha=0.6, color='blue')
+        lims = [min(np.min(targets), np.min(predictions)), max(np.max(targets), np.max(predictions))]
+        ax1.plot(lims, lims, 'r--')
+        ax1.set_xlabel('True Heat Transport')
+        ax1.set_ylabel('Predicted Heat Transport')
+        ax1.set_title('Prediction Scatter')
         ax2.plot(time_indices, targets, 'b-', label='True', alpha=0.7)
         ax2.plot(time_indices, predictions, 'r--', label='Predicted', alpha=0.7)
         ax2.set_xlabel('Time Steps')
-        ax2.set_ylabel('Heat Transport (Normalized)')
-        ax2.set_title('Heat Transport Time Series')
+        ax2.set_ylabel('Heat Transport')
+        ax2.set_title('Time Series Comparison')
         ax2.legend()
-        
-        note_text = ("Note: Values shown are normalized. Raw values in degC*m³/s\n"
-                    "To convert to Watts: multiply by 4184 * 1025")
-        fig.text(0.1, 0.01, note_text, fontsize=8, style='italic')
         plt.tight_layout()
-        
         if save_path:
-            save_path = self.output_dir / 'predictions' / f"{save_path}.png"
-            plt.savefig(save_path, dpi=self.dpi, bbox_inches='tight')
+            sp = self.output_dir / 'predictions' / f"{save_path}.png"
+            plt.savefig(sp, dpi=self.dpi, bbox_inches='tight')
             plt.close()
-            self.logger.info(f"Saved predictions plot to {save_path}")
-            return None
-        return fig
+            self.logger.info(f"Saved predictions plot to: {sp}")
+        else:
+            return fig
+
+    def plot_error_histogram(self, predictions, targets, save_path=None):
+        self.logger.info("Plotting error histogram")
+        errors = predictions - targets
+        fig, ax = plt.subplots(figsize=(8, 6))
+        sns.histplot(errors, kde=True, ax=ax, color='orange')
+        ax.set_title("Error Distribution")
+        ax.set_xlabel("Prediction Error")
+        if save_path:
+            sp = self.output_dir / 'plots' / f"{save_path}.png"
+            plt.savefig(sp, dpi=self.dpi, bbox_inches='tight')
+            plt.close()
+            self.logger.info(f"Saved error histogram to: {sp}")
+        else:
+            return fig
