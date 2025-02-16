@@ -16,29 +16,25 @@ from src.utils.dask_utils import dask_monitor
 import torch._dynamo
 torch._dynamo.config.disable = True
 from src.train import OceanTrainer
-
 logging.basicConfig(
     level='INFO',
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('ocean_analysis.log')]
 )
 logger = logging.getLogger(__name__)
-
 def setup_random_seeds():
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
-
 def setup_directories(config):
-    dirs = [config['paths']['output_dir'], config['paths']['model_dir'], 
+    dirs = [config['paths']['output_dir'], config['paths']['model_dir'],
             Path(config['paths']['model_dir']) / 'checkpoints',
             Path(config['paths']['output_dir']) / 'plots',
             Path(config['paths']['output_dir']) / 'attention_maps']
     for d in dirs:
         Path(d).mkdir(parents=True, exist_ok=True)
         logger.info(f"Ensured directory exists: {d}")
-
 def load_config(config_path: str) -> dict:
     logger.info(f"Loading configuration from {config_path}")
     try:
@@ -54,14 +50,13 @@ def load_config(config_path: str) -> dict:
     except Exception as e:
         logger.error(f"Error loading configuration: {str(e)}")
         raise
-
 def train_model(config: dict, data_processor: OceanDataProcessor):
     torch.backends.cudnn.benchmark = True
     try:
         with dask_monitor.monitor_operation("training_data_preparation"):
             ssh, sst, tlat, tlong = data_processor.get_spatial_data()
             config['data'].update({'tlat': tlat.compute(), 'tlong': tlong.compute()})
-            heat_transport, heat_transport_mean = data_processor.calculate_heat_transport()
+            heat_transport, heat_transport_mean, heat_transport_std = data_processor.calculate_heat_transport()
             logger.info(f"Using heat transport mean: {heat_transport_mean}")
         spatial_size = (data_processor.shape[1] // 2, data_processor.shape[2] // 2)
         model = OceanTransformer(
@@ -81,7 +76,7 @@ def train_model(config: dict, data_processor: OceanDataProcessor):
             device='cuda'
         )
         train_loader, val_loader, test_loader = trainer.create_dataloaders(
-            ssh, sst, heat_transport, heat_transport_mean,
+            ssh, sst, heat_transport, heat_transport_mean, heat_transport_std,
             data_processor.ssh_mean, data_processor.ssh_std,
             data_processor.sst_mean, data_processor.sst_std,
             data_processor.shape
@@ -93,7 +88,7 @@ def train_model(config: dict, data_processor: OceanDataProcessor):
             logger.info(f"Resumed from epoch {start_epoch} with metrics: {metrics}")
         trainer.train(train_loader, val_loader, start_epoch=start_epoch)
         logger.info("Generating predictions and attention visualizations")
-        test_metrics, predictions, attention_maps = trainer.evaluate(test_loader, heat_transport_mean)
+        test_metrics, predictions, attention_maps = trainer.evaluate(test_loader, heat_transport_mean, heat_transport_std)
         visualizer = OceanVisualizer(output_dir=config['paths']['output_dir'])
         visualizer.plot_predictions(predictions, heat_transport, time_indices=np.arange(len(predictions)), save_path='predictions')
         visualizer.plot_attention_maps(attention_maps, ssh.nlat, ssh.nlon, save_path='attention_maps')
@@ -118,7 +113,6 @@ def train_model(config: dict, data_processor: OceanDataProcessor):
         if wandb.run:
             wandb.finish()
         dask_monitor.shutdown()
-
 def main():
     parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
     parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
@@ -149,6 +143,5 @@ def main():
         if wandb.run:
             wandb.finish()
         dask_monitor.shutdown()
-
 if __name__ == "__main__":
     main()

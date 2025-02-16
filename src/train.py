@@ -53,12 +53,12 @@ class OceanTrainer:
         )
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler()
-    def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean,
+    def create_dataloaders(self, ssh_data, sst_data, heat_transport_data, heat_transport_mean, heat_transport_std,
                            ssh_mean, ssh_std, sst_mean, sst_std, shape):
         debug_mode = self.config['training'].get('debug_mode', False)
         debug_samples = self.config['training'].get('debug_samples', 32)
         dataset = OceanDataset(
-            ssh_data, sst_data, heat_transport_data, heat_transport_mean,
+            ssh_data, sst_data, heat_transport_data, heat_transport_mean, heat_transport_std,
             ssh_mean, ssh_std, sst_mean, sst_std, shape,
             debug=debug_mode
         )
@@ -142,7 +142,6 @@ class OceanTrainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip'])
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        # Call scheduler.step() after optimizer.step()
                         if self.scheduler is not None:
                             self.scheduler.step()
                     epoch_loss += loss.item() * accumulation_steps
@@ -159,10 +158,9 @@ class OceanTrainer:
                     'epoch/val_rmse': val_metrics['val_rmse'],
                     'epoch/time': epoch_time
                 })
-                # Save per-epoch attention maps for diagnostics.
                 viz = OceanVisualizer(self.save_dir)
                 if val_metrics.get('attention_maps', None) is not None:
-                    viz.plot_attention_maps(val_metrics['attention_maps'], 
+                    viz.plot_attention_maps(val_metrics['attention_maps'],
                                             self.config.get('data', {}).get('tlat', None),
                                             self.config.get('data', {}).get('tlong', None),
                                             save_path=f'attention_epoch_{epoch}')
@@ -276,7 +274,7 @@ class OceanTrainer:
         self.logger.info(f"Resumed training from epoch {checkpoint['epoch']}")
         return checkpoint['epoch'], checkpoint['metrics']
     @torch.no_grad()
-    def evaluate(self, test_loader, heat_transport_mean: float):
+    def evaluate(self, test_loader, heat_transport_mean: float, heat_transport_std: float):
         self.model.eval()
         predictions = []
         targets = []
@@ -292,8 +290,8 @@ class OceanTrainer:
             with autocast():
                 output, attn_maps = self.model(ssh, sst, attention_mask)
                 loss = self.criterion(output, target)
-            predictions.append((output.cpu() + heat_transport_mean).numpy())
-            targets.append((target.cpu() + heat_transport_mean).numpy())
+            predictions.append((output.cpu() * heat_transport_std + heat_transport_mean).numpy())
+            targets.append((target.cpu() * heat_transport_std + heat_transport_mean).numpy())
             test_losses.append(loss.item())
             batch_size = ssh.shape[0]
             if all_attention_maps is None:
