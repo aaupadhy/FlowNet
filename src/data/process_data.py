@@ -11,6 +11,7 @@ from tqdm import tqdm
 from ..utils.dask_utils import dask_monitor
 
 class OceanDataProcessor:
+    
     def __init__(self, ssh_path: str, sst_path: str, vnt_path: str):
         self.logger = logging.getLogger(__name__)
         self.cache_dir = Path('/scratch/user/aaupadhy/college/RA/final_data/cache')
@@ -44,9 +45,11 @@ class OceanDataProcessor:
         self._validate_statistics()
         self._validate_data_consistency()
         self.logger.info("Successfully loaded all datasets")
+    
     def _cleanup_memory(self):
         gc.collect()
         torch.cuda.empty_cache()
+    
     def _validate_data_consistency(self):
         if not (len(self.ssh_ds.time) == len(self.sst_ds.time) == len(self.vnt_ds.time)):
             raise ValueError("Temporal dimensions do not match across datasets")
@@ -57,6 +60,7 @@ class OceanDataProcessor:
         if not np.allclose(self.ssh_ds.nlat, self.sst_ds.nlat) or \
            not np.allclose(self.ssh_ds.nlon, self.sst_ds.nlon):
             raise ValueError("Coordinate systems do not match between datasets")
+    
     def _validate_statistics(self):
         stat_checks = {
             'ssh_mean': (-500, 500),
@@ -104,6 +108,7 @@ class OceanDataProcessor:
             raise
         finally:
             self._cleanup_memory()
+            
     def _compute_mean_std(self, data_array, var_name: str):
         cache_file = self.cache_dir / f'{var_name}_stats.npy'
         if cache_file.exists():
@@ -129,6 +134,7 @@ class OceanDataProcessor:
         except Exception as e:
             self.logger.error(f"Error computing statistics for {var_name}: {str(e)}")
             raise
+        
     def calculate_heat_transport(self, latitude_index=None):
         if latitude_index is None:
             latitude_index = self.reference_latitude
@@ -180,6 +186,7 @@ class OceanDataProcessor:
         )
 
 class OceanDataset(torch.utils.data.Dataset):
+    
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean, heat_transport_std,
                  ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False):
         self.logger = logging.getLogger(__name__)
@@ -210,9 +217,12 @@ class OceanDataset(torch.utils.data.Dataset):
         self.logger.info(f"  SSH std:  {self.ssh_std:.4f}")
         self.logger.info(f"  SST mean: {self.sst_mean:.4f}")
         self.logger.info(f"  SST std:  {self.sst_std:.4f}")
+   
     def __len__(self):
         return self.length
+   
     def __getitem__(self, idx):
+        
         try:
             self.logger.debug(f"Fetching item {idx}")
             ssh_vals = np.asarray(self.ssh[idx].values, dtype=np.float32)
@@ -231,22 +241,14 @@ class OceanDataset(torch.utils.data.Dataset):
             ssh_tensor = torch.from_numpy(ssh_norm).float().unsqueeze(0)
             sst_tensor = torch.from_numpy(sst_norm).float().unsqueeze(0)
             mask_tensor = torch.from_numpy(ssh_valid & sst_valid).float()
-            self.logger.debug(f"Downsampling for item {idx}")
-            ssh_downsampled = F.avg_pool2d(ssh_tensor.unsqueeze(0),
-                                         kernel_size=2,
-                                         stride=2).squeeze(0)
-            sst_downsampled = F.avg_pool2d(sst_tensor.unsqueeze(0),
-                                         kernel_size=2,
-                                         stride=2).squeeze(0)
-            mask_downsampled = F.avg_pool2d(mask_tensor.unsqueeze(0).unsqueeze(0),
-                                          kernel_size=2,
-                                          stride=2).squeeze(0).squeeze(0)
+            # self.logger.debug(f"Downsampling for item {idx}")
             target = torch.tensor(self.heat_transport[idx], dtype=torch.float32)
             self.logger.debug(f"Successfully prepared item {idx}")
-            return (ssh_downsampled,
-                   sst_downsampled,
-                   mask_downsampled,
+            return (ssh_tensor,
+                   sst_tensor,
+                   mask_tensor,
                    target)
+            
         except Exception as e:
             self.logger.error(f"Error in __getitem__ at index {idx}: {str(e)}")
             self.logger.error(traceback.format_exc())
