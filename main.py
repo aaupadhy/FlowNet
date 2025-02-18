@@ -1,147 +1,80 @@
 import argparse
-import yaml
-from pathlib import Path
 import logging
 import sys
-import time
-from datetime import datetime
-import torch
 import traceback
-import wandb
 import numpy as np
-from src.architecture.transformer import OceanTransformer
+import os
+import torch
+import yaml
+from pathlib import Path
+from src.train import OceanTrainer,setup_random_seeds
+from src.utils.dask_utils import dask_monitor
 from src.data.process_data import OceanDataProcessor
 from src.utils.visualization import OceanVisualizer
-from src.utils.dask_utils import dask_monitor
-import torch._dynamo
-torch._dynamo.config.disable = True
-from src.train import OceanTrainer
-logging.basicConfig(
-    level='INFO',
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('ocean_analysis.log')]
-)
-logger = logging.getLogger(__name__)
-def setup_random_seeds():
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-def setup_directories(config):
-    dirs = [config['paths']['output_dir'], config['paths']['model_dir'],
-            Path(config['paths']['model_dir']) / 'checkpoints',
-            Path(config['paths']['output_dir']) / 'plots',
-            Path(config['paths']['output_dir']) / 'attention_maps']
-    for d in dirs:
-        Path(d).mkdir(parents=True, exist_ok=True)
-        logger.info(f"Ensured directory exists: {d}")
-def load_config(config_path: str) -> dict:
-    logger.info(f"Loading configuration from {config_path}")
+
+def parse_args():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--mode',type=str,default='all',help='all|train|predict')
+    parser.add_argument('--config',type=str,default='config/data.yml')
+    return parser.parse_args()
+
+def load_config(path):
+    with open(path,'r') as f:
+        return yaml.safe_load(f)
+
+def ensure_dir_exists(dir_path):
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
+def train_model(args):
+    cfg=load_config(args.config)
+    logging.info(f"Loading configuration from {args.config}")
+    logging.info("Configuration loaded successfully")
+    ensure_dir_exists(cfg['paths']['output_dir'])
+    ensure_dir_exists(cfg['paths']['model_dir'])
+    ensure_dir_exists(os.path.join(cfg['paths']['model_dir'],'checkpoints'))
+    ensure_dir_exists(os.path.join(cfg['paths']['output_dir'],'plots'))
+    ensure_dir_exists(os.path.join(cfg['paths']['output_dir'],'attention_maps'))
+    cdata=load_config(args.config)
+    dask_monitor.setup_optimal_cluster({'n_workers':cdata['dask']['n_workers'],'threads_per_worker':cdata['dask']['threads_per_worker']})
+    with dask_monitor.monitor_operation("initialization"):
+        pass
+    dp=OceanDataProcessor(cfg['paths']['ssh_zarr'],cfg['paths']['sst_zarr'],cfg['paths']['vnt_zarr'])
+    with dask_monitor.monitor_operation("training_data_preparation"):
+        heat_transport,ht_mean,ht_std=dp.calculate_heat_transport()
+        logging.info(f"Using heat transport mean: {ht_mean}")
+    from src.train import OceanTrainer
+    from src.architecture.transformer import OceanTransformer
+    model=OceanTransformer(spatial_size=(dp.stats['spatial_dims']['nlat'],dp.stats['spatial_dims']['nlon']),d_model=cfg['training']['d_model'],nhead=cfg['training']['n_heads'],num_layers=cfg['training']['num_layers'],dim_feedforward=cfg['training']['dim_feedforward'],dropout=cfg['training']['dropout'])
+    trainer=OceanTrainer(model,cfg,save_dir=cfg['paths']['model_dir'])
+    ssh, sst, _, _=dp.get_spatial_data()
+    train_loader,val_loader,test_loader=trainer.create_dataloaders(ssh,sst,heat_transport,ht_mean,ht_std,dp.ssh_mean,dp.ssh_std,dp.sst_mean,dp.sst_std,dp.stats['grid_shape'])
+    trainer.train(train_loader,val_loader,start_epoch=0)
+    logging.info("Generating predictions and attention visualizations")
     try:
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-        for key in ['paths', 'dask', 'data', 'monitoring', 'training']:
-            if key not in config:
-                raise ValueError(f"Missing config section: {key}")
-        for path_key in ['output_dir', 'model_dir']:
-            Path(config['paths'][path_key]).mkdir(parents=True, exist_ok=True)
-        logger.info("Configuration loaded successfully")
-        return config
+        test_metrics,predictions,test_truth=trainer.evaluate(test_loader,ht_mean,ht_std)
+        viz=OceanVisualizer(cfg['paths']['output_dir'])
+        logging.info("Plotting final predictions...")
+        viz.plot_predictions(predictions,test_truth,time_indices=np.arange(len(predictions)),save_path='predictions')
     except Exception as e:
-        logger.error(f"Error loading configuration: {str(e)}")
-        raise
-def train_model(config: dict, data_processor: OceanDataProcessor):
-    torch.backends.cudnn.benchmark = True
-    try:
-        with dask_monitor.monitor_operation("training_data_preparation"):
-            ssh, sst, tlat, tlong = data_processor.get_spatial_data()
-            config['data'].update({'tlat': tlat.compute(), 'tlong': tlong.compute()})
-            heat_transport, heat_transport_mean, heat_transport_std = data_processor.calculate_heat_transport()
-            logger.info(f"Using heat transport mean: {heat_transport_mean}")
-        spatial_size = (data_processor.shape[1] // 2, data_processor.shape[2] // 2)
-        model = OceanTransformer(
-            spatial_size=spatial_size,
-            d_model=config['training']['d_model'],
-            nhead=config['training']['n_heads'],
-            num_layers=config['training']['num_layers'],
-            dim_feedforward=config['training']['dim_feedforward'],
-            dropout=config['training']['dropout']
-        )
-        if hasattr(torch, 'compile'):
-            model = torch.compile(model, backend='eager')
-        trainer = OceanTrainer(
-            model=model,
-            config=config,
-            save_dir=Path(config['paths']['model_dir']),
-            device='cuda'
-        )
-        train_loader, val_loader, test_loader = trainer.create_dataloaders(
-            ssh, sst, heat_transport, heat_transport_mean, heat_transport_std,
-            data_processor.ssh_mean, data_processor.ssh_std,
-            data_processor.sst_mean, data_processor.sst_std,
-            data_processor.shape
-        )
-        checkpoint_path = Path(config['paths']['model_dir']) / 'checkpoints/latest_checkpoint.pt'
-        start_epoch = 0
-        if checkpoint_path.exists():
-            start_epoch, metrics = trainer.resume_from_checkpoint(str(checkpoint_path))
-            logger.info(f"Resumed from epoch {start_epoch} with metrics: {metrics}")
-        trainer.train(train_loader, val_loader, start_epoch=start_epoch)
-        logger.info("Generating predictions and attention visualizations")
-        test_metrics, predictions, attention_maps = trainer.evaluate(test_loader, heat_transport_mean, heat_transport_std)
-        visualizer = OceanVisualizer(output_dir=config['paths']['output_dir'])
-        visualizer.plot_predictions(predictions, heat_transport, time_indices=np.arange(len(predictions)), save_path='predictions')
-        visualizer.plot_attention_maps(attention_maps, ssh.nlat, ssh.nlon, save_path='attention_maps')
-        logger.info(f"Test metrics: {test_metrics}")
-        results = {
-            'test_metrics': test_metrics,
-            'predictions': predictions.tolist(),
-            'attention_maps': {k: v.tolist() for k, v in attention_maps.items()}
-        }
-        results_path = Path(config['paths']['output_dir']) / 'results.json'
-        with open(results_path, 'w') as f:
-            import json
-            json.dump(results, f)
-    except Exception as e:
-        logger.error(f"Error during training: {str(e)}")
-        logger.error(traceback.format_exc())
-        if wandb.run:
-            wandb.finish()
-        sys.exit(1)
+        logging.error(f"Error during training: {e}")
+        logging.error(traceback.format_exc())
     finally:
-        logger.info("Cleaning up resources...")
-        if wandb.run:
-            wandb.finish()
-        dask_monitor.shutdown()
+        logging.info("Cleaning up resources...")
+
 def main():
-    parser = argparse.ArgumentParser(description='Ocean Heat Transport Analysis')
-    parser.add_argument('--config', default='config/data.yml', help='Path to configuration file')
-    parser.add_argument('--mode', choices=['analyze', 'train', 'all'], default='train', help='Mode of operation')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    args = parser.parse_args()
+    args=parse_args()
     setup_random_seeds()
-    setup_directories(load_config(args.config))
     try:
-        config = load_config(args.config)
-        with dask_monitor.monitor_operation("initialization"):
-            client = dask_monitor.setup_optimal_cluster(config['dask'])
-        data_processor = OceanDataProcessor(
-            ssh_path=config['paths']['ssh_zarr'],
-            sst_path=config['paths']['sst_zarr'],
-            vnt_path=config['paths']['vnt_zarr']
-        )
-        if args.mode in ['train', 'all']:
-            train_model(config, data_processor)
+        if args.mode=='all' or args.mode=='train':
+            train_model(args)
+        else:
+            pass
     except Exception as e:
-        logger.error(f"Error in main execution: {str(e)}")
-        logger.error(traceback.format_exc())
-        if wandb.run:
-            wandb.finish()
-        sys.exit(1)
+        logging.error(f"Error: {e}")
+        logging.error(traceback.format_exc())
     finally:
-        logger.info("Cleaning up resources...")
-        if wandb.run:
-            wandb.finish()
-        dask_monitor.shutdown()
-if __name__ == "__main__":
+        logging.info("Cleaning up resources...")
+
+if __name__=='__main__':
     main()

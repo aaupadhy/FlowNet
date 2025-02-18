@@ -69,7 +69,7 @@ training:
     patience: 10
     batch_size: 16
     learning_rate: 0.0001
-    epochs: 10
+    epochs: 5
     accumulation_steps: 8
     early_stopping_patience: 10
     validation_split: 0.15
