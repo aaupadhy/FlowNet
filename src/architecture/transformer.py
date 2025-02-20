@@ -4,115 +4,123 @@ import torch.nn.functional as F
 import math
 import logging
 
-class PatchEmbed(nn.Module):
-    def __init__(self,in_channels,embed_dim,patch_size):
+class PatchEmbed2D(nn.Module):
+    def __init__(self, in_channels, embed_dim, patch_size=8):
         super().__init__()
-        self.proj=nn.Conv2d(in_channels,embed_dim,kernel_size=patch_size,stride=patch_size)
-    def forward(self,x,mask=None):
-        x=self.proj(x)
-        b,c,h,w=x.shape
-        x=x.flatten(2).transpose(1,2)
-        return x,None
-
-class MultiModalFusion(nn.Module):
-    def __init__(self,d_model,dropout=0.3):
-        super().__init__()
-        self.fu=nn.Sequential(nn.Linear(2*d_model,d_model),nn.LayerNorm(d_model),nn.GELU(),nn.Dropout(dropout))
-    def forward(self,a,b):
-        return self.fu(torch.cat([a,b],dim=-1))
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+    def forward(self, x):
+        x = self.proj(x)  # (B, embed_dim, H/patch, W/patch)
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        return x, (H, W)
 
 class SpatialPositionalEncoding2D(nn.Module):
-    def __init__(self,d_model,dropout=0.3):
+    def __init__(self, embed_dim, dropout=0.1):
         super().__init__()
-        self.d_model=d_model
-        self.dr=nn.Dropout(dropout)
-    def forward(self,x,h,w):
-        b,l,e=x.shape
-        if e!=self.d_model:
-            raise RuntimeError()
-        if l!=h*w:
-            raise RuntimeError()
-        p=self._make_pe(h,w).to(x.device)
-        x=x+p[:,:l]
-        return self.dr(x)
-    def _make_pe(self,hh,ww):
-        d=self.d_model
-        out=torch.zeros(1,hh*ww,d)
-        r=torch.arange(hh).float().unsqueeze(1)
-        c=torch.arange(ww).float().unsqueeze(1)
-        dh=d//2
-        dr=torch.exp(torch.arange(0,dh,2).float()*(-math.log(10000.0)/dh))
-        dc=torch.exp(torch.arange(0,dh,2).float()*(-math.log(10000.0)/dh))
-        rr=torch.zeros(hh,dh)
-        cc=torch.zeros(ww,dh)
-        for i in range(0,dh,2):
-            ix=i//2
-            rr[:,i]=torch.sin(r.squeeze(1)*dr[ix])
-            rr[:,i+1]=torch.cos(r.squeeze(1)*dr[ix])
-            cc[:,i]=torch.sin(c.squeeze(1)*dc[ix])
-            cc[:,i+1]=torch.cos(c.squeeze(1)*dc[ix])
-        tmp=torch.zeros(hh,ww,d)
-        for i in range(hh):
-            for j in range(ww):
-                tmp[i,j,:dh]=rr[i]
-                tmp[i,j,dh:]=cc[j]
-        return tmp.view(1,hh*ww,d)
+        self.dropout = nn.Dropout(dropout)
+        self.embed_dim = embed_dim
+    def forward(self, x, h, w):
+        B, N, C = x.shape
+        if N != h * w:
+            raise ValueError("Number of patches does not match spatial dims")
+        pe = self._build_pe(h, w, C).to(x.device)  # (1, h*w, C)
+        x = x + pe
+        return self.dropout(x)
+    def _build_pe(self, h, w, d_model):
+        pe = torch.zeros(1, d_model, h, w)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pos_h = torch.arange(0, h).unsqueeze(1).float()  # (h, 1)
+        pos_w = torch.arange(0, w).unsqueeze(1).float()  # (w, 1)
+        pe[0, 0::2, :, :] = torch.sin((pos_h * div_term).t()).unsqueeze(2).repeat(1,1,w)
+        pe[0, 1::2, :, :] = torch.cos((pos_h * div_term).t()).unsqueeze(2).repeat(1,1,w)
+        pe_w = torch.zeros(1, d_model, h, w)
+        pe_w[0, 0::2, :, :] = torch.sin((pos_w * div_term).t()).unsqueeze(1).repeat(1,h,1)
+        pe_w[0, 1::2, :, :] = torch.cos((pos_w * div_term).t()).unsqueeze(1).repeat(1,h,1)
+        pe = pe + pe_w
+        pe = pe.flatten(2).transpose(1, 2)  # (1, h*w, d_model)
+        return pe
+
+class MultiModalFusion(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.linear = nn.Linear(2 * d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x1, x2):
+        x = torch.cat([x1, x2], dim=-1)
+        x = self.linear(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return self.dropout(x)
 
 class OceanTransformer(nn.Module):
-    def __init__(self,spatial_size,d_model=128,nhead=4,num_layers=4,dim_feedforward=512,dropout=0.1,patch_size=16):
+    def __init__(self, spatial_size, d_model=256, nhead=8, num_layers=6, dim_feedforward=512, dropout=0.1, patch_size=8):
         super().__init__()
-        self.logger=logging.getLogger(__name__)
-        self.d_model=d_model
-        self.nhead=nhead
-        self.patch_size=patch_size
-        self.ssh_down=nn.Sequential(
-            nn.Conv2d(1,d_model//4,3,2,1),nn.BatchNorm2d(d_model//4),nn.GELU(),
-            nn.Conv2d(d_model//4,d_model//2,3,2,1),nn.BatchNorm2d(d_model//2),nn.GELU()
+        self.logger = logging.getLogger(__name__)
+        self.d_model = d_model
+        self.patch_size = patch_size
+        self.ssh_cnn = nn.Sequential(
+            nn.Conv2d(1, d_model // 4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(d_model // 4),
+            nn.ReLU(),
+            nn.Conv2d(d_model // 4, d_model // 2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(d_model // 2),
+            nn.ReLU()
         )
-        self.sst_down=nn.Sequential(
-            nn.Conv2d(1,d_model//4,3,2,1),nn.BatchNorm2d(d_model//4),nn.GELU(),
-            nn.Conv2d(d_model//4,d_model//2,3,2,1),nn.BatchNorm2d(d_model//2),nn.GELU()
+        self.sst_cnn = nn.Sequential(
+            nn.Conv2d(1, d_model // 4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(d_model // 4),
+            nn.ReLU(),
+            nn.Conv2d(d_model // 4, d_model // 2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(d_model // 2),
+            nn.ReLU()
         )
-        self.ssh_patch=PatchEmbed(d_model//2,d_model,patch_size)
-        self.sst_patch=PatchEmbed(d_model//2,d_model,patch_size)
-        self.fusion=MultiModalFusion(d_model,dropout)
-        self.cls_token=nn.Parameter(torch.zeros(1,1,d_model))
-        enc=nn.TransformerEncoderLayer(d_model,nhead,dim_feedforward,dropout,activation=F.gelu,batch_first=True,norm_first=True)
-        self.transformer=nn.TransformerEncoder(enc,num_layers)
-        self.pos2d=SpatialPositionalEncoding2D(d_model,dropout)
-        self.pre_fc=nn.Sequential(nn.Linear(d_model,d_model//2),nn.GELU(),nn.LayerNorm(d_model//2),nn.Dropout(dropout/2))
-        self.out_fc=nn.Linear(d_model//2,1)
-        self.apply(self._init)
-    def _init(self,m):
-        if isinstance(m,(nn.Linear,nn.Conv2d)):
-            nn.init.kaiming_normal_(m.weight,mode='fan_out',nonlinearity='relu')
-            if m.bias is not None:
+        self.ssh_patch = PatchEmbed2D(d_model // 2, d_model, patch_size=patch_size)
+        self.sst_patch = PatchEmbed2D(d_model // 2, d_model, patch_size=patch_size)
+        self.fusion = MultiModalFusion(d_model, dropout=dropout)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_encoder = SpatialPositionalEncoding2D(d_model, dropout=dropout)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        # New regressor: aggregates three signals
+        self.regressor = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.BatchNorm1d(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1)
+        )
+        self._init_weights()
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        elif isinstance(m,(nn.BatchNorm2d,nn.LayerNorm)):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
-    def forward(self,ssh,sst,attention_mask=None):
-        b=ssh.size(0)
-        se=self.ssh_down(ssh)
-        te=self.sst_down(sst)
-        p1,_=self.ssh_patch(se,None)
-        p2,_=self.sst_patch(te,None)
-        f=self.fusion(p1,p2)
-        _,_,hh,ww=se.shape
-        hs=hh//self.patch_size
-        ws=ww//self.patch_size
-        c=torch.cat([self.cls_token.expand(b,1,self.d_model),f],dim=1)
-        xp=c[:,1:]
-        xp=self.pos2d(xp,hs,ws)
-        x=torch.cat([c[:,0:1],xp],dim=1)
-        x=self.transformer(x)
-        attn=torch.matmul(x,x.transpose(-2,-1))/math.sqrt(self.d_model)
-        attn=F.softmax(attn,dim=-1)
-        pooled=x[:,0]
-        h=self.pre_fc(pooled)
-        o=self.out_fc(h).squeeze(-1)
-        m={}
-        with torch.no_grad():
-            cls_row=attn[:,0:1,1:].mean(1)
-            m['cls']=cls_row
-        return o,m
+    def forward(self, ssh, sst, mask=None):
+        B = ssh.shape[0]
+        ssh_feat = self.ssh_cnn(ssh)  # (B, d_model//2, H1, W1)
+        ssh_patches, (h1, w1) = self.ssh_patch(ssh_feat)  # (B, N, d_model)
+        sst_feat = self.sst_cnn(sst)  # (B, d_model//2, H1, W1)
+        sst_patches, _ = self.sst_patch(sst_feat)  # (B, N, d_model)
+        fused = self.fusion(ssh_patches, sst_patches)  # (B, N, d_model)
+        skip = fused.mean(dim=1)  # (B, d_model)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
+        x_input = torch.cat([cls_tokens, fused], dim=1)  # (B, 1+N, d_model)
+        pe = self.pos_encoder(x_input[:,1:], h1, w1)
+        x_input = torch.cat([x_input[:,0:1], pe], dim=1)
+        x_trans = self.transformer(x_input)  # (B, 1+N, d_model)
+        cls_token = x_trans[:,0]  # (B, d_model)
+        patch_avg = x_trans[:,1:].mean(dim=1)  # (B, d_model)
+        # Aggregate three signals: (CLS + skip), patch average, and skip.
+        rep = torch.cat([cls_token + skip, patch_avg, skip], dim=1)  # (B, 3*d_model)
+        out = self.regressor(rep).squeeze(-1)  # (B,)
+        sim = F.cosine_similarity(cls_token.unsqueeze(1), x_trans[:,1:], dim=-1)  # (B, N)
+        attn_list = [sim.unsqueeze(1)]
+        return out, {'attn': attn_list, 'patch_dims': (h1, w1)}
+

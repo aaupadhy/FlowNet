@@ -6,35 +6,34 @@ paths:
   model_dir: "models"
 
 dask:
-  total_memory: 120           
-  n_workers: 4             
-  threads_per_worker: 4         
-  chunk_optimization: true      
-  monitor_chunks: true    
+  total_memory: 120
+  n_workers: 4
+  threads_per_worker: 4
+  chunk_optimization: true
+  monitor_chunks: true
   worker_config:
-    memory_target: 0.6    # New: fraction of memory at which to start spilling to disk
-    memory_spill: 0.70    # New: fraction of memory at which to spill data to disk
-    memory_pause: 0.75    # New: fraction of memory at which to pause worker
-    memory_terminate: 0.80        
+    memory_target: 0.6
+    memory_spill: 0.70
+    memory_pause: 0.80
+    memory_terminate: 0.85
   dashboard:
-    port: 8787                 
-    verbose: true              
+    port: 8787
+    verbose: true
   optimization:
-    fuse_operations: true       
-    split_large_chunks: false   
-    retry_count: 10            
+    fuse_operations: true
+    split_large_chunks: false
+    retry_count: 10
 
 data:
-  region_mask_value: 6          
-  reference_latitude: 1600      
-  tarea_conversion: 0.0001       
-  dz_conversion: 0.01          
+  region_mask_value: 6
+  tarea_conversion: 0.0001
+  dz_conversion: 0.01
   chunking:
-    time_chunk: 180          
-    spatial_chunk_target: 300    
-    preserve_dims: ['z_t']     
+    time_chunk: 180
+    spatial_chunk_target: 300
+    preserve_dims: ['z_t']
 
-monitoring:  # New section
+monitoring:
   enabled: true
   profiling:
     enabled: true
@@ -42,58 +41,64 @@ monitoring:  # New section
     performance: true
     resource_tracking: true
   memory_thresholds:
-    warning: 0.70     # Fraction of memory that triggers warning
-    critical: 0.85    # Fraction of memory that triggers critical warning
+    warning: 0.70
+    critical: 0.85
   logging:
     level: "INFO"
     file: "dask_monitor.log"
-  dashboard_update_interval: 1000 
+  dashboard_update_interval: 1000
 
 visualization:
   dpi: 300
-  fig_size: [12, 8]            
-  save_formats: ['png', 'pdf'] 
-  interactive: true           
+  fig_size: [12, 8]
+  save_formats: ['png', 'pdf']
+  interactive: true
   colormaps:
-    ssh: "cmo.thermal"        
-    sst: "cmo.thermal"         
-    attention: "viridis"      
+    ssh: "cmo.thermal"
+    sst: "cmo.thermal"
+    attention: "viridis"
+
 training:
-    debug_mode: false
-    debug_samples: 32
-    d_model: 256
-    n_heads: 8
-    num_layers: 4
-    dim_feedforward: 512
-    dropout: 0.1
-    patience: 10
-    batch_size: 16
-    learning_rate: 0.0001
-    epochs: 5
-    accumulation_steps: 8
-    early_stopping_patience: 10
-    validation_split: 0.15
-    test_split: 0.15
-    grad_clip: 1.0
+  debug_mode: false
+  debug_samples: 32
+  d_model: 256
+  n_heads: 8
+  num_layers: 6
+  dim_feedforward: 512
+  dropout: 0.1
+  patience: 10
+  batch_size: 32
+  learning_rate: 0.0005
+  epochs: 20
+  accumulation_steps: 8
+  early_stopping_patience: 10
+  validation_split: 0.15
+  test_split: 0.15
+  grad_clip: 1.0
+  weight_decay: 0.01
+  optimizer:
+    name: "adamw"
     weight_decay: 0.01
-    optimizer:
-        name: "adamw"
-        weight_decay: 0.01
-    
-    scheduler:
-        name: "onecycle"
-        max_lr: 0.001
-        pct_start: 0.4
-    save_freq: 5
-    checkpoint_dir: "checkpoints"
+  scheduler:
+    name: "onecycle"
+    max_lr: 0.002
+    pct_start: 0.4
+  save_freq: 5
+  checkpoint_dir: "checkpoints"
+  log_target: true           # Use log transform for target.
+  target_scale: 10.0         # Fixed scaling factor for log(target).
 
 error_handling:
-  max_retries: 3              
-  retry_delay: 5              
-  save_state: true           
-  cleanup_on_fail: true     
+  max_retries: 3
+  retry_delay: 5
+  save_state: true
+  cleanup_on_fail: true
 
 limits:
-  max_memory_gb: 150          
-  max_duration_hours: 24      
-  min_free_memory_gb: 10      
+  max_memory_gb: 150
+  max_duration_hours: 24
+  min_free_memory_gb: 10
+
+preload_data: true
+wandb_mode: "offline"
+
