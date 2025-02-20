@@ -7,7 +7,6 @@ from pathlib import Path
 import logging
 from scipy.interpolate import griddata
 import xarray as xr
-
 class OceanVisualizer:
     def __init__(self, output_dir, fig_size=(12,8), dpi=300):
         self.output_dir = Path(output_dir)
@@ -45,12 +44,19 @@ class OceanVisualizer:
         attn_list = attn_dict['attn']
         patch_dims = attn_dict.get('patch_dims', None)
         num_layers = len(attn_list)
-        fig, axs = plt.subplots(1, num_layers, figsize=(5*num_layers, 5), subplot_kw={'projection': self.projection})
         if num_layers == 1:
-            axs = [axs]
+            fig, ax = plt.subplots(figsize=(6,6), subplot_kw={'projection': self.projection})
+            axs = [ax]
+        else:
+            fig, axs = plt.subplots(1, num_layers, figsize=(6*num_layers,6), subplot_kw={'projection': self.projection})
+            if num_layers == 1:
+                axs = [axs]
         for ax, attn in zip(axs, attn_list):
             attn_mean = attn[0].detach().cpu().numpy()
-            grid_shape = self._get_patch_grid(attn_mean.size, patch_dims)
+            if patch_dims is not None:
+                grid_shape = patch_dims
+            else:
+                grid_shape = self._get_patch_grid(attn_mean.size)
             try:
                 attn_map = attn_mean.reshape(grid_shape)
             except Exception as e:
@@ -58,10 +64,11 @@ class OceanVisualizer:
                 return
             attn_map_resized = self._r(attn_map, (100, 100))
             im = ax.imshow(attn_map_resized, extent=[-80, 0, 30, 65], origin='upper', transform=self.projection, cmap='viridis')
-            ax.add_feature(cfeature.COASTLINE)
+            ax.coastlines(resolution='50m')
             ax.add_feature(cfeature.BORDERS, linestyle=':')
             ax.set_extent([-80, 0, 30, 65], crs=self.projection)
-            plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.05)
+            ax.set_title("Attention Map")
+        fig.colorbar(im, ax=axs, orientation='horizontal', pad=0.05)
         plt.tight_layout()
         if save_path:
             sp = self.output_dir / 'attention_maps' / f'{save_path}.png'
@@ -124,4 +131,3 @@ class OceanVisualizer:
             plt.close()
         else:
             plt.show()
-

@@ -10,9 +10,8 @@ import gc
 from tqdm import tqdm
 from time import time
 from ..utils.dask_utils import dask_monitor
-
+import pandas as pd
 logger = logging.getLogger(__name__)
-
 class OceanDataProcessor:
     def __init__(self, ssh_path: str, sst_path: str, vnt_path: str, preload_data: bool = False, cache_data: bool = True):
         logger.info("Initializing OceanDataProcessor")
@@ -44,6 +43,7 @@ class OceanDataProcessor:
                 self.ssh_array = self.ssh_ds["SSH"].values
                 self.sst_array = self.sst_ds["SST"].values
                 logger.info("Cached SSH and SST arrays in memory.")
+        
         t0 = time()
         with dask_monitor.profile_task("compute_statistics"):
             logger.info("Computing SSH mean and std")
@@ -208,19 +208,21 @@ class OceanDataProcessor:
             self.vnt_ds["TLAT"],
             self.vnt_ds["TLONG"]
         )
-
 class OceanDataset(torch.utils.data.Dataset):
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean, heat_transport_std,
                  ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False, log_target=False, target_scale=10.0):
         self.logger = logging.getLogger(__name__)
         self.logger.info("Initializing OceanDataset")
         self.log_target = log_target
-        self.target_scale = target_scale  # Fixed scaling factor from config.
+        self.target_scale = target_scale
         if debug:
             self.ssh = ssh.isel(time=slice(0, 32))
             self.sst = sst.isel(time=slice(0, 32))
             self.heat_transport = heat_transport[:32]
             self.length = 32
+            units = self.ssh.coords['time'].attrs.get('units')
+            calendar = self.ssh.coords['time'].attrs.get('calendar')
+            self.months = pd.DatetimeIndex(xr.conventions.times.decode_cf_datetime(self.ssh.coords['time'].values, units, calendar)).month.to_numpy()
         else:
             self.logger.info("Using lazy dask arrays for full dataset")
             self.ssh = ssh
@@ -228,6 +230,9 @@ class OceanDataset(torch.utils.data.Dataset):
             self.heat_transport = heat_transport
             self.length = shape[0]
             self.logger.info("Dataset arrays set. Shape: %s", ssh.shape)
+            units = self.ssh.coords['time'].attrs.get('units')
+            calendar = self.ssh.coords['time'].attrs.get('calendar')
+            self.months = pd.DatetimeIndex(xr.conventions.times.decode_cf_datetime(self.ssh.coords['time'].values, units, calendar)).month.to_numpy()
         self.heat_transport_mean = float(heat_transport_mean)
         self.heat_transport_std = float(heat_transport_std)
         if self.log_target:
@@ -274,4 +279,3 @@ class OceanDataset(torch.utils.data.Dataset):
         except Exception as e:
             self.logger.error("Error in __getitem__ at index %d: %s", idx, str(e))
             raise
-

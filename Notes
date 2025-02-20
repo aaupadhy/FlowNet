@@ -1,0 +1,4 @@
+- Seperate SST, SSH
+- Add Wind Stress
+- Normalize definitely
+- Check if we are using the correct timesteps

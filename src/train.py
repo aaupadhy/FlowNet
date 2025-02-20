@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import logging
 import traceback
 import os
@@ -13,21 +13,19 @@ from datetime import datetime
 from src.architecture.transformer import OceanTransformer
 from src.utils.visualization import OceanVisualizer
 from torch.cuda.amp import autocast, GradScaler
-
+from sklearn.model_selection import train_test_split
 class SmoothHuberLoss(nn.Module):
     def __init__(self, beta=1.0):
         super().__init__()
         self.beta = beta
     def forward(self, pred, target):
         return nn.functional.smooth_l1_loss(pred, target, beta=self.beta)
-
 def setup_random_seeds():
     s = 42
     torch.manual_seed(s)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(s)
     np.random.seed(s)
-
 class OceanTrainer:
     def __init__(self, model, config, save_dir, device='cuda'):
         self.model = model.to(device)
@@ -54,22 +52,21 @@ class OceanTrainer:
         log_target = self.config['training'].get('log_target', False)
         target_scale = self.config['training'].get('target_scale', 10.0)
         ds = OceanDataset(ssh_data, sst_data, ht_data, ht_mean, ht_std, ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=dbg, log_target=log_target, target_scale=target_scale)
-        ts = len(ds)
-        if dbg:
-            tr = dbg_s // 2
-            v = dbg_s // 4
-            te = dbg_s // 4
-        else:
-            tr = int(0.7 * ts)
-            v = int(0.15 * ts)
-            te = ts - tr - v
-        g = torch.Generator().manual_seed(42)
-        tr_ds, v_ds, te_ds = random_split(ds, [tr, v, te], generator=g)
+        import numpy as np
+        indices = np.arange(len(ds))
+        stratify_labels = ds.months
+        train_idx, temp_idx = train_test_split(indices, test_size=0.3, random_state=42, stratify=stratify_labels)
+        temp_strat = stratify_labels[temp_idx]
+        val_idx, test_idx = train_test_split(temp_idx, test_size=0.5, random_state=42, stratify=temp_strat)
+        from torch.utils.data import Subset
+        tr_ds = Subset(ds, train_idx)
+        v_ds = Subset(ds, val_idx)
+        te_ds = Subset(ds, test_idx)
         bs = self.config['training']['batch_size']
         tr_dl = DataLoader(tr_ds, batch_size=bs, shuffle=True, pin_memory=True, num_workers=4, persistent_workers=True, drop_last=True)
         va_dl = DataLoader(v_ds, batch_size=bs, pin_memory=True, num_workers=2)
         te_dl = DataLoader(te_ds, batch_size=bs, pin_memory=True, num_workers=2)
-        self.logger.info(f"Created dataloaders - Train: {len(tr_dl.dataset)}, Val: {len(va_dl.dataset)}, Test: {len(te_dl.dataset)}")
+        self.logger.info(f"Created dataloaders - Train: {len(tr_ds)}, Val: {len(v_ds)}, Test: {len(te_ds)}")
         return tr_dl, va_dl, te_dl
     def setup_scheduler(self, train_loader):
         sps = len(train_loader) // self.config['training'].get('accumulation_steps', 4)
@@ -114,8 +111,8 @@ class OceanTrainer:
                 et = time.time() - est
                 v = self.validate(val_loader)
                 self.logger.info(f"Epoch {e+1} Summary:\nTrain Loss: {el:.4f}\nVal Loss: {v['val_loss']:.4f}\nVal R²: {v['val_r2']:.4f}\nVal RMSE: {v['val_rmse']:.4f}\nVal MAPE: {v['val_mape']:.4f}\nExplained Var: {v['explained_variance']:.4f}\nTime: {et:.2f}s")
-                wandb.log({'epoch': e, 'epoch/train_loss': el, 'epoch/val_loss': v['val_loss'], 'epoch/val_r2': v['val_r2'], 
-                           'epoch/val_rmse': v['val_rmse'], 'epoch/val_mape': v['val_mape'], 'epoch/explained_variance': v['explained_variance'], 
+                wandb.log({'epoch': e, 'epoch/train_loss': el, 'epoch/val_loss': v['val_loss'], 'epoch/val_r2': v['val_r2'],
+                           'epoch/val_rmse': v['val_rmse'], 'epoch/val_mape': v['val_mape'], 'epoch/explained_variance': v['explained_variance'],
                            'epoch/time': et})
                 if v['val_loss'] < best_val:
                     best_val = v['val_loss']
@@ -216,4 +213,3 @@ class OceanTrainer:
         with torch.no_grad(), autocast():
             out, out_dict = self.model(sample_ssh.to(self.device), sample_sst.to(self.device), sample_mask.to(self.device))
         return out_dict.get('attn', [])
-
