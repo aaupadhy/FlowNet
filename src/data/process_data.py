@@ -11,7 +11,9 @@ from tqdm import tqdm
 from time import time
 from ..utils.dask_utils import dask_monitor
 import pandas as pd
+
 logger = logging.getLogger(__name__)
+
 class OceanDataProcessor:
     def __init__(self, ssh_path: str, sst_path: str, vnt_path: str, preload_data: bool = False, cache_data: bool = True):
         logger.info("Initializing OceanDataProcessor")
@@ -43,7 +45,6 @@ class OceanDataProcessor:
                 self.ssh_array = self.ssh_ds["SSH"].values
                 self.sst_array = self.sst_ds["SST"].values
                 logger.info("Cached SSH and SST arrays in memory.")
-        
         t0 = time()
         with dask_monitor.profile_task("compute_statistics"):
             logger.info("Computing SSH mean and std")
@@ -69,9 +70,11 @@ class OceanDataProcessor:
         self._validate_statistics()
         self._validate_data_consistency()
         logger.info("Successfully loaded all datasets")
+
     def _cleanup_memory(self):
         gc.collect()
         torch.cuda.empty_cache()
+
     def _validate_data_consistency(self):
         if not (len(self.ssh_ds.time) == len(self.sst_ds.time) == len(self.vnt_ds.time)):
             raise ValueError("Temporal dimensions do not match across datasets")
@@ -81,6 +84,18 @@ class OceanDataProcessor:
             raise ValueError(f"Spatial dimensions mismatch: SSH {ssh_shape} vs SST {sst_shape}")
         if not np.allclose(self.ssh_ds.nlat, self.sst_ds.nlat) or not np.allclose(self.ssh_ds.nlon, self.sst_ds.nlon):
             raise ValueError("Coordinate systems do not match between datasets")
+
+    def validate_coordinates(self):
+        for coord in ['nlat', 'nlon', 'time']:
+            ssh_coord = self.ssh_ds.coords.get(coord)
+            sst_coord = self.sst_ds.coords.get(coord)
+            vnt_coord = self.vnt_ds.coords.get(coord)
+            if ssh_coord is None or sst_coord is None or vnt_coord is None:
+                raise ValueError(f"Missing coordinate: {coord}")
+            if not np.array_equal(ssh_coord.values, sst_coord.values) or not np.array_equal(ssh_coord.values, vnt_coord.values):
+                raise ValueError(f"Mismatch found in coordinate {coord}")
+        logger.info("All spatial and temporal coordinates match.")
+
     def _validate_statistics(self):
         stat_checks = {
             'ssh_mean': (-500, 500),
@@ -98,6 +113,7 @@ class OceanDataProcessor:
                 raise ValueError(f"Zero {stat_name} detected")
             if not min_val <= value <= max_val:
                 raise ValueError(f"{stat_name} ({value:.2f}) outside reasonable range [{min_val}, {max_val}]")
+
     def _find_reference_latitude(self) -> int:
         cache_file = self.cache_dir / 'ref_lat_index.npy'
         if cache_file.exists():
@@ -127,6 +143,7 @@ class OceanDataProcessor:
             raise
         finally:
             self._cleanup_memory()
+
     def _compute_mean_std(self, data_array, var_name: str):
         cache_file = self.cache_dir / f'{var_name}_stats.npy'
         if cache_file.exists():
@@ -153,6 +170,7 @@ class OceanDataProcessor:
         except Exception as e:
             logger.warning("Failed to cache statistics: %s", str(e))
         return mean, std
+
     def calculate_heat_transport(self, latitude_index=None):
         if latitude_index is None:
             latitude_index = self.reference_latitude
@@ -201,13 +219,22 @@ class OceanDataProcessor:
             raise
         finally:
             self._cleanup_memory()
+
     def get_spatial_data(self):
-        return (
-            self.ssh_ds["SSH"],
-            self.sst_ds["SST"],
-            self.vnt_ds["TLAT"],
-            self.vnt_ds["TLONG"]
-        )
+        # Return SSH, SST, and coordinate arrays for TLAT and TLONG.
+        return (self.ssh_ds["SSH"], self.sst_ds["SST"],
+                self.vnt_ds["TLAT"], self.vnt_ds["TLONG"])
+
+def aggregate_vnt(predicted_vnt, tarea, dz, tarea_conversion=0.0001, dz_conversion=0.01, ref_lat_index=0):
+    """
+    Aggregate the predicted VNT field.
+    predicted_vnt: Tensor of shape (B, 62, nlat, nlon)
+    Multiply elementwise with tarea and dz (with conversion factors) and sum over z_t and nlon.
+    Select the row corresponding to the reference latitude.
+    """
+    agg = (predicted_vnt * tarea * tarea_conversion * dz * dz_conversion).sum(dim=[1, 3])
+    return agg[:, ref_lat_index]
+
 class OceanDataset(torch.utils.data.Dataset):
     def __init__(self, ssh, sst, heat_transport, heat_transport_mean, heat_transport_std,
                  ssh_mean, ssh_std, sst_mean, sst_std, shape, debug=False, log_target=False, target_scale=10.0):
@@ -222,7 +249,19 @@ class OceanDataset(torch.utils.data.Dataset):
             self.length = 32
             units = self.ssh.coords['time'].attrs.get('units')
             calendar = self.ssh.coords['time'].attrs.get('calendar')
-            self.months = pd.DatetimeIndex(xr.conventions.times.decode_cf_datetime(self.ssh.coords['time'].values, units, calendar)).month.to_numpy()
+            time_vals = self.ssh.coords['time'].values
+            try:
+                if units is None or calendar is None:
+                    self.months = np.array([pd.Timestamp(str(t)).month for t in time_vals])
+                else:
+                    decoded = xr.conventions.times.decode_cf_datetime(time_vals, units, calendar)
+                    if hasattr(decoded[0], "strftime"):
+                        self.months = pd.DatetimeIndex(decoded).month.to_numpy()
+                    else:
+                        self.months = np.array([pd.Timestamp(str(t)).month for t in decoded])
+            except Exception as e:
+                self.logger.warning("Failed to decode time using units/calendar: %s", str(e))
+                self.months = np.array([pd.Timestamp(str(t)).month for t in time_vals])
         else:
             self.logger.info("Using lazy dask arrays for full dataset")
             self.ssh = ssh
@@ -232,7 +271,19 @@ class OceanDataset(torch.utils.data.Dataset):
             self.logger.info("Dataset arrays set. Shape: %s", ssh.shape)
             units = self.ssh.coords['time'].attrs.get('units')
             calendar = self.ssh.coords['time'].attrs.get('calendar')
-            self.months = pd.DatetimeIndex(xr.conventions.times.decode_cf_datetime(self.ssh.coords['time'].values, units, calendar)).month.to_numpy()
+            time_vals = self.ssh.coords['time'].values
+            try:
+                if units is None or calendar is None:
+                    self.months = np.array([pd.Timestamp(str(t)).month for t in time_vals])
+                else:
+                    decoded = xr.conventions.times.decode_cf_datetime(time_vals, units, calendar)
+                    if hasattr(decoded[0], "strftime"):
+                        self.months = pd.DatetimeIndex(decoded).month.to_numpy()
+                    else:
+                        self.months = np.array([pd.Timestamp(str(t)).month for t in decoded])
+            except Exception as e:
+                self.logger.warning("Failed to decode time using units/calendar: %s", str(e))
+                self.months = np.array([pd.Timestamp(str(t)).month for t in time_vals])
         self.heat_transport_mean = float(heat_transport_mean)
         self.heat_transport_std = float(heat_transport_std)
         if self.log_target:
@@ -250,8 +301,10 @@ class OceanDataset(torch.utils.data.Dataset):
         self.logger.info("Normalization parameters:")
         self.logger.info("  SSH mean: %.4f, SSH std: %.4f", self.ssh_mean, self.ssh_std)
         self.logger.info("  SST mean: %.4f, SST std: %.4f", self.sst_mean, self.sst_std)
+
     def __len__(self):
         return self.length
+
     def __getitem__(self, idx):
         try:
             t0 = time()

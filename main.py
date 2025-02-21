@@ -8,10 +8,8 @@ import torch
 import yaml
 from pathlib import Path
 from src.train import OceanTrainer, setup_random_seeds
-from src.utils.dask_utils import dask_monitor
 from src.data.process_data import OceanDataProcessor
-from src.utils.visualization import OceanVisualizer
-import dask
+from src.utils.dask_utils import dask_monitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,7 +17,6 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
-logger.info("Starting main.py execution")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -69,13 +66,18 @@ def train_model(args):
         logger.info("Shutting down Dask cluster")
         dask_monitor.shutdown()
     from src.architecture.transformer import OceanTransformer
+    # Set target_nlat and target_nlon equal to the native resolution of SSH/SST
+    target_nlat = dp.stats['spatial_dims']['nlat']
+    target_nlon = dp.stats['spatial_dims']['nlon']
     model = OceanTransformer(
         spatial_size=(dp.stats['spatial_dims']['nlat'], dp.stats['spatial_dims']['nlon']),
         d_model=cfg['training']['d_model'],
         nhead=cfg['training']['n_heads'],
         num_layers=cfg['training']['num_layers'],
         dim_feedforward=cfg['training']['dim_feedforward'],
-        dropout=cfg['training']['dropout']
+        dropout=cfg['training']['dropout'],
+        target_nlat=target_nlat,
+        target_nlon=target_nlon
     )
     trainer = OceanTrainer(model, cfg, save_dir=cfg['paths']['model_dir'])
     ssh, sst, _, _ = dp.get_spatial_data()
@@ -89,6 +91,7 @@ def train_model(args):
     logger.info("Generating predictions and attention visualizations")
     try:
         test_metrics, predictions, test_truth, attn_maps = trainer.evaluate(test_loader, ht_mean, ht_std)
+        from src.utils.visualization import OceanVisualizer
         viz = OceanVisualizer(cfg['paths']['output_dir'])
         logger.info("Plotting final predictions...")
         viz.plot_predictions(predictions, test_truth, time_indices=np.arange(len(predictions)), save_path='predictions')
@@ -113,7 +116,7 @@ def main():
     args = parse_args()
     setup_random_seeds()
     try:
-        if args.mode == 'all' or args.mode == 'train':
+        if args.mode in ['all', 'train']:
             train_model(args)
         else:
             logger.info("Mode not implemented")
@@ -125,4 +128,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
