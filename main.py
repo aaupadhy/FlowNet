@@ -10,6 +10,8 @@ from pathlib import Path
 from src.train import OceanTrainer, setup_random_seeds
 from src.data.process_data import OceanDataProcessor
 from src.utils.dask_utils import dask_monitor
+from src.utils.visualization import OceanVisualizer
+from src.architecture.transformer import OceanTransformer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,11 +39,13 @@ def train_model(args):
     cfg = load_config(args.config)
     logger.info("Loading configuration from %s", args.config)
     logger.info("Configuration loaded successfully")
+    
     ensure_dir_exists(cfg['paths']['output_dir'])
     ensure_dir_exists(cfg['paths']['model_dir'])
     ensure_dir_exists(os.path.join(cfg['paths']['model_dir'], 'checkpoints'))
     ensure_dir_exists(os.path.join(cfg['paths']['output_dir'], 'plots'))
     ensure_dir_exists(os.path.join(cfg['paths']['output_dir'], 'attention_maps'))
+    
     dask_enabled = cfg.get("dask", {}).get("enabled", True)
     if dask_enabled:
         logger.info("Setting up Dask cluster")
@@ -51,22 +55,29 @@ def train_model(args):
             'use_processes': cfg['dask'].get('use_processes', False)
         })
     else:
-        logger.info("Dask disabled in configuration; using synchronous scheduler")
+        logger.info("Dask disabled in configuration")
+        import dask
         dask.config.set(scheduler='synchronous')
+        
     with dask_monitor.monitor_operation("initialization"):
-        logger.info("Initialization phase complete")
-    logger.info("Creating OceanDataProcessor")
-    preload = cfg.get("preload_data", False)
-    dp = OceanDataProcessor(cfg['paths']['ssh_zarr'], cfg['paths']['sst_zarr'], cfg['paths']['vnt_zarr'], preload_data=preload)
+        logger.info("Creating OceanDataProcessor")
+        preload = cfg.get("preload_data", False)
+        dp = OceanDataProcessor(
+            cfg['paths']['ssh_zarr'],
+            cfg['paths']['sst_zarr'],
+            cfg['paths']['vnt_zarr'],
+            preload_data=preload
+        )
+        
     with dask_monitor.monitor_operation("training_data_preparation"):
         logger.info("Calculating heat transport")
         heat_transport, ht_mean, ht_std = dp.calculate_heat_transport()
         logger.info("Using heat transport mean: %s", ht_mean)
+        
     if dask_enabled:
         logger.info("Shutting down Dask cluster")
         dask_monitor.shutdown()
-    from src.architecture.transformer import OceanTransformer
-    # Set target_nlat and target_nlon equal to the native resolution of SSH/SST
+
     target_nlat = dp.stats['spatial_dims']['nlat']
     target_nlon = dp.stats['spatial_dims']['nlon']
     model = OceanTransformer(
@@ -79,6 +90,7 @@ def train_model(args):
         target_nlat=target_nlat,
         target_nlon=target_nlon
     )
+    
     trainer = OceanTrainer(model, cfg, save_dir=cfg['paths']['model_dir'])
     ssh, sst, _, _ = dp.get_spatial_data()
     train_loader, val_loader, test_loader = trainer.create_dataloaders(
@@ -86,31 +98,64 @@ def train_model(args):
         dp.ssh_mean, dp.ssh_std, dp.sst_mean, dp.sst_std,
         dp.stats['grid_shape']
     )
+    
     logger.info("Starting training")
     trainer.train(train_loader, val_loader, start_epoch=0)
-    logger.info("Generating predictions and attention visualizations")
+    
+    logger.info("Training completed. Starting evaluation phase...")
     try:
-        test_metrics, predictions, test_truth, attn_maps = trainer.evaluate(test_loader, ht_mean, ht_std)
-        from src.utils.visualization import OceanVisualizer
         viz = OceanVisualizer(cfg['paths']['output_dir'])
-        logger.info("Plotting final predictions...")
-        viz.plot_predictions(predictions, test_truth, time_indices=np.arange(len(predictions)), save_path='predictions')
-        if attn_maps:
-            test_iter = iter(test_loader)
-            sample = next(test_iter)
-            sample_ssh, sample_sst, sample_mask, _ = sample
-            attn = trainer.plot_attention_maps(sample_ssh, sample_sst, sample_mask)
+        
+        test_metrics, predictions, test_truth, attn_dict = trainer.evaluate(test_loader, ht_mean, ht_std)
+        
+        logger.info("Plotting predictions...")
+        viz.plot_predictions(
+            predictions, 
+            test_truth, 
+            time_indices=np.arange(len(predictions)), 
+            save_path='final_predictions'
+        )
+        
+        logger.info("Plotting error histogram...")
+        viz.plot_error_histogram(
+            predictions,
+            test_truth,
+            save_path='prediction_errors'
+        )
+        
+        if attn_dict and 'attn' in attn_dict:
             logger.info("Plotting attention maps...")
-            _, attn_dict = trainer.model(sample_ssh.to(trainer.device), sample_sst.to(trainer.device), sample_mask.to(trainer.device))
-            patch_dims = attn_dict.get('patch_dims', None)
-            viz.plot_attention_maps({'attn': attn, 'patch_dims': patch_dims}, save_path='attention_maps')
+            viz.plot_attention_maps(attn_dict, save_path='final_attention_maps')
         else:
-            logger.info("No attention maps available for visualization.")
+            logger.warning("No attention maps available for visualization.")
+        
+        logger.info("Plotting temporal trends...")
+        viz.plot_temporal_trends(
+            np.arange(len(predictions)),
+            test_truth,
+            predictions,
+            save_path='temporal_trends'
+        )
+        
+        logger.info("Final Test Metrics:")
+        for metric_name, value in test_metrics.items():
+            logger.info(f"{metric_name}: {value:.4f}")
+            
+        if cfg.get('wandb_mode', 'online') != 'disabled':
+            wandb.run.summary.update(test_metrics)
+            
     except Exception as e:
-        logger.error("Error during training: %s", e)
+        logger.error(f"Error during evaluation: {str(e)}")
         logger.error(traceback.format_exc())
+    
     finally:
         logger.info("Cleaning up resources...")
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.finish()
+        except Exception as e:
+            logger.warning(f"Error while closing wandb: {str(e)}")
 
 def main():
     args = parse_args()

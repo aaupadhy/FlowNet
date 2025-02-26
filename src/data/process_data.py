@@ -304,31 +304,87 @@ class OceanDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.length
-
+    
     def __getitem__(self, idx):
         try:
-            t0 = time()
+            t0 = time.time()
             self.logger.debug("Fetching item %d", idx)
+            
+            # Get raw values
             ssh_vals = np.asarray(self.ssh[idx].values, dtype=np.float32)
             sst_vals = np.asarray(self.sst[idx].values, dtype=np.float32)
+            
+            # Debug prints for raw data
+            print(f"\nData point {idx}:")
+            print(f"Raw SSH shape: {ssh_vals.shape}")
+            print(f"Raw SST shape: {sst_vals.shape}")
+            print(f"Raw SSH range: {np.nanmin(ssh_vals):.6f} to {np.nanmax(ssh_vals):.6f}")
+            print(f"Raw SST range: {np.nanmin(sst_vals):.6f} to {np.nanmax(sst_vals):.6f}")
+            print(f"SSH mean/std used: {self.ssh_mean:.6f}/{self.ssh_std:.6f}")
+            print(f"SST mean/std used: {self.sst_mean:.6f}/{self.sst_std:.6f}")
+            
+            # Process masks
             self.logger.debug("Processing masks for item %d", idx)
             ssh_valid = ~np.isnan(ssh_vals)
             sst_valid = ~np.isnan(sst_vals)
+            
+            print(f"Valid SSH points: {np.sum(ssh_valid)}/{ssh_valid.size} ({100*np.sum(ssh_valid)/ssh_valid.size:.2f}%)")
+            print(f"Valid SST points: {np.sum(sst_valid)}/{sst_valid.size} ({100*np.sum(sst_valid)/sst_valid.size:.2f}%)")
+            
+            # Normalize data
             self.logger.debug("Normalizing data for item %d", idx)
             ssh_norm = np.where(ssh_valid,
-                                (ssh_vals - self.ssh_mean) / (self.ssh_std + 1e-8),
-                                0)
+                            (ssh_vals - self.ssh_mean) / (self.ssh_std + 1e-8),
+                            0)
             sst_norm = np.where(sst_valid,
-                                (sst_vals - self.sst_mean) / (self.sst_std + 1e-8),
-                                0)
+                            (sst_vals - self.sst_mean) / (self.sst_std + 1e-8),
+                            0)
+            
+            print(f"Normalized SSH range: {np.nanmin(ssh_norm):.6f} to {np.nanmax(ssh_norm):.6f}")
+            print(f"Normalized SST range: {np.nanmin(sst_norm):.6f} to {np.nanmax(sst_norm):.6f}")
+            
+            # Get target value
+            raw_target = self.heat_transport[idx]
+            print(f"Raw target value: {raw_target:.6f}")
+            
+            if self.log_target:
+                print(f"Using log transform with scale {self.target_scale}")
+                target = np.log(np.abs(raw_target) + 1e-8) / self.target_scale
+                print(f"Log-transformed target: {target:.6f}")
+                if not np.isfinite(target):
+                    print("WARNING: Non-finite target after log transform!")
+                    target = 0.0
+            else:
+                target = raw_target
+                print(f"Untransformed target: {target:.6f}")
+            
+            # Create tensors
             self.logger.debug("Creating tensors for item %d", idx)
             ssh_tensor = torch.from_numpy(ssh_norm).float().unsqueeze(0)
             sst_tensor = torch.from_numpy(sst_norm).float().unsqueeze(0)
             mask_tensor = torch.from_numpy(ssh_valid & sst_valid).float()
-            target = torch.tensor(self.heat_transport[idx], dtype=torch.float32)
-            t_elapsed = time() - t0
-            self.logger.debug("Item %d processed in %.4f seconds; SSH min=%.2f, max=%.2f", idx, t_elapsed, float(np.min(ssh_vals)), float(np.max(ssh_vals)))
-            return (ssh_tensor, sst_tensor, mask_tensor, target)
+            target_tensor = torch.tensor(target, dtype=torch.float32)
+            
+            # Verify tensor shapes and values
+            print(f"SSH tensor shape: {ssh_tensor.shape}, range: {ssh_tensor.min():.6f} to {ssh_tensor.max():.6f}")
+            print(f"SST tensor shape: {sst_tensor.shape}, range: {sst_tensor.min():.6f} to {sst_tensor.max():.6f}")
+            print(f"Mask tensor shape: {mask_tensor.shape}, valid points: {mask_tensor.sum()}/{mask_tensor.numel()}")
+            print(f"Target tensor: {target_tensor.item():.6f}")
+            
+            t_elapsed = time.time() - t0
+            self.logger.debug("Item %d processed in %.4f seconds", idx, t_elapsed)
+            
+            invalid_count = torch.isnan(ssh_tensor).sum() + torch.isnan(sst_tensor).sum() + torch.isnan(target_tensor)
+            if invalid_count > 0:
+                print(f"WARNING: Found {invalid_count} invalid values in tensors!")
+                
+            if not torch.isfinite(target_tensor):
+                print(f"WARNING: Non-finite target tensor: {target_tensor.item()}")
+                
+            return (ssh_tensor, sst_tensor, mask_tensor, target_tensor)
+            
         except Exception as e:
             self.logger.error("Error in __getitem__ at index %d: %s", idx, str(e))
+            print(f"Detailed error in __getitem__ at index {idx}:")
+            print(traceback.format_exc())
             raise
