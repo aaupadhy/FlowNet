@@ -59,6 +59,9 @@ visualization:
     attention: "viridis"
 
 training:
+  vnt_supervision: true
+  vnt_loss_weight: 0.1
+  eval_vnt_aggregation: true
   debug_mode: false
   debug_samples: 32
   d_model: 256
