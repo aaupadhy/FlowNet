@@ -88,8 +88,8 @@ training:
     pct_start: 0.4
   save_freq: 5
   checkpoint_dir: "checkpoints"
-  log_target: true           # Use log transform for target.
-  target_scale: 10.0         # Fixed scaling factor for log(target).
+  log_target: true           
+  target_scale: 10.0       
 
 error_handling:
   max_retries: 3
@@ -102,6 +102,6 @@ limits:
   max_duration_hours: 24
   min_free_memory_gb: 10
 
-preload_data: true
+preload_data: false
 wandb_mode: "offline"
 
